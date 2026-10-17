@@ -1,0 +1,5 @@
+data/
+*.db
+*.db-*
+dump.jsonl
+node_modules/

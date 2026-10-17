@@ -1,0 +1,25 @@
+{
+  "name": "claude-monitor",
+  "version": "1.0.0",
+  "description": "One dashboard for Claude Code on several computers: tokens, API-priced cost, sessions, subscription limits and each computer's share, limits and stopping.",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "usage",
+    "monitoring",
+    "opentelemetry",
+    "dashboard"
+  ],
+  "author": "TMuhammadqodir",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test \"test/**/*.test.mjs\""
+  }
+}
