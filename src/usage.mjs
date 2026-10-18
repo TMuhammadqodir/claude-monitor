@@ -397,6 +397,21 @@ function forecastOf(limit, reports, now) {
 }
 
 /**
+ * Between two reports from Anthropic, the percentage the requests since the last one add, at the account's
+ * rate per percent (see ratePerPercent): telemetry comes every few seconds, the exact numbers once in a while.
+ * `live` is that estimate (never below the exact number, at most 100); the next report replaces it. Use from
+ * places the monitor does not see is not in it, so it can read a little low.
+ */
+function liveOf(db, limit, { account, reports, fallback, since, now }) {
+  if (limit.reset || !LIMIT_SPANS[limit.kind]) return limit;
+  const cost = (from, to, kind) => costByMachine(db, account, fallback, from, to, kind);
+  const added = sum(cost(since + 1, now, limit.kind));
+  if (!(added > 0)) return limit;
+  const rate = ratePerPercent(db, reports, cost, limit.kind);
+  return rate ? { ...limit, live: Math.min(100, limit.percent + added / rate), liveSince: since } : limit;
+}
+
+/**
  * The latest exact percentages of each account (from the last six hours), with how the 5-hour and weekly
  * shares went over the last week. A limit that has reset since the report reads 0. Given the machines, each
  * limit is also split between the machines that used the account (see splitUsage).
@@ -428,6 +443,7 @@ export function exactUsage(db, now = Date.now(), { machines = null, settings = n
         .map((l) => (l.reset ? l : { ...l, forecast: forecastOf(l, entry.reports, now) }));
       const result = { account: entry.account, email: entry.latest.email, ts: entry.latest.ts, limits, history: entry.history };
       if (!machines) return result;
+      result.limits = limits.map((l) => liveOf(db, l, { account: entry.account, reports: entry.reports, fallback, since: entry.latest.ts, now }));
       // A weekly limit spans more than the chart's week: its rate looks back over the month of reports.
       return { ...result, ...splitUsage(db, { account: entry.account, limits, reports: entry.reports, machines, fallback, settings, now }) };
     });

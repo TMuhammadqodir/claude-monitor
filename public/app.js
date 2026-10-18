@@ -382,6 +382,12 @@ function limitRing(title, share, { reset = null, center = null, sub = '', note =
       ${paceLine(forecast, reset)}</div></div>`;
 }
 
+// Between Anthropic's reports a limit can carry an estimate from the requests since (see liveOf on the server).
+const shown = (l) => l.live ?? l.percent;
+const liveCenter = (l) => (l.live != null && Math.round(l.live) !== Math.round(l.percent) ? `≈${Math.round(l.live)}%` : null);
+const liveNote = (l) =>
+  liveCenter(l) ? t('aniq {percent}% ({clock}), keyingi so‘rovlar bilan taxmin', { percent: Math.round(l.percent), clock: clockTime(l.liveSince) }) : '';
+
 /** At the recent pace: when the limit runs out, or that it lasts until it resets. */
 function paceLine(forecast, reset) {
   if (!forecast) return '';
@@ -436,13 +442,13 @@ function accountCard(a, machines) {
     const month = exact.month;
     return `<div class="card sub-card">${head}
       <div class="sub-rings">
-        ${five ? limitRing(t('5 soatlik sessiya'), five.percent / 100, { reset: resetOf(five), forecast: five.forecast }) : ''}
-        ${week ? limitRing(t('Haftalik'), week.percent / 100, { reset: resetOf(week), forecast: week.forecast }) : ''}
+        ${five ? limitRing(t('5 soatlik sessiya'), shown(five) / 100, { reset: resetOf(five), forecast: five.forecast, center: liveCenter(five), sub: liveNote(five) }) : ''}
+        ${week ? limitRing(t('Haftalik'), shown(week) / 100, { reset: resetOf(week), forecast: week.forecast, center: liveCenter(week), sub: liveNote(week) }) : ''}
         ${month ? limitRing(t('Oylik (taxminiy)'), month.percent / 100, { sub: `${dateLabel(month.from)} – ${dateLabel(month.to - 1)}<br>${t('{n} haftalik limitga teng', { n: (month.weekly / 100).toFixed(1) })}`, color: 'var(--info)' }) : ''}
       </div>
       ${extra.map((l) => `<div class="limit-row"><span>${h(t(l.label))}</span><span><b>${percent(l.percent / 100)}</b></span><div class="bar"><i style="width:${Math.min(100, l.percent)}%;--c:${shareColor(l.percent / 100)}"></i></div></div>`).join('')}
       ${splitTable(exact)}
-      <p class="faint sub-note">${t('Anthropic’dan {clock} da olindi ({when}), Claude Code’dagi /usage bilan bir xil. Agent foizni Claude har javobni tugatganda yuboradi, ko‘pi bilan daqiqada bir marta: Claude ishlab turganda panel 1 daqiqagacha orqada qoladi, ishlamay turganda yangilanmaydi. Yangi 5 soatlik oyna boshida birinchi hisobot 0% bo‘lishi mumkin. Kompyuterning ulushi uning shu davrdagi sarfidan.', { clock: clockTime(exact.ts), when: ago(exact.ts) })}${month ? ' ' + t('Oylik — taxmin: Anthropic’da oylik limit yo‘q, oy {n} haftalik limitga teng deb olinadi.', { n: month.weeks.toFixed(1) }) : ''}</p>
+      <p class="faint sub-note">${t('Anthropic’dan {clock} da olindi ({when}), Claude Code’dagi /usage bilan bir xil. Agent foizni har daqiqada so‘raydi, Claude ishlayotganda va undan keyin 10 daqiqa davomida; orada ≈ belgili son har so‘rov bilan hisoblanadi. Yangi 5 soatlik oyna boshida birinchi hisobot 0% bo‘lishi mumkin. Kompyuterning ulushi uning shu davrdagi sarfidan.', { clock: clockTime(exact.ts), when: ago(exact.ts) })}${month ? ' ' + t('Oylik — taxmin: Anthropic’da oylik limit yo‘q, oy {n} haftalik limitga teng deb olinadi.', { n: month.weeks.toFixed(1) }) : ''}</p>
     </div>`;
   }
 

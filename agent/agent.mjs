@@ -50,7 +50,12 @@ const POLICY_KEYS = ['availableModels', 'enforceAvailableModels', 'maxEffortLeve
 
 // How often the exact percentages are sent at most; how long a limit answer is reused between tool calls;
 // how often the logs are read again for what telemetry lost; how often the server is asked for a newer agent.
+// Anthropic's usage address answers 429 when asked too often (it says neither how often nor how long to wait),
+// so once a minute; the dashboard works out the percentage in between from the requests themselves.
 const REPORT_SECONDS = 60;
+// How long after the last hook the percentages are still asked for: use elsewhere on the account (another
+// computer, claude.ai) moves them too, and the end of an answer is reported, not missed.
+const ACTIVE_SECONDS = 600;
 const GUARD_SECONDS = 10;
 const CATCH_UP_SECONDS = 3600;
 const UPDATE_SECONDS = 6 * 3600;
@@ -111,7 +116,7 @@ const SAY = {
   andTools: [' va har asbob oldidan tekshiriladi', ' and before each tool call', ' и перед каждым вызовом инструмента'],
   notChecked: ['tekshirilmaydi', 'not checked', 'не проверяется'],
   statusPercent: ['Foiz:   {how}', 'Percent: {how}', 'Проценты: {how}'],
-  afterAnswer: ['har javobdan keyin, ko‘pi bilan {n} soniyada bir', 'after each answer, at most every {n} seconds', 'после каждого ответа, не чаще раза в {n} секунд'],
+  afterAnswer: ['har {n} soniyada, Claude ishlayotganda va undan keyin 10 daqiqa', 'every {n} seconds while Claude works and for 10 minutes after', 'каждые {n} секунд, пока Claude работает, и ещё 10 минут после'],
   onlyPrompt: ['faqat prompt oldidan (node agent.mjs update)', 'only before a prompt (node agent.mjs update)', 'только перед промптом (node agent.mjs update)'],
   statusLink: ['Aloqa:  {state}', 'Link:   {state}', 'Связь:  {state}'],
   linkRefused: ['✗ server tokenni qabul qilmadi: panelda yangi token olib, "setup" ni qayta ishga tushiring', '✗ the server refuses the token: get a new one on the dashboard and run "setup" again', '✗ сервер не принимает токен: получите новый на панели и снова выполните "setup"'],
@@ -377,7 +382,22 @@ async function fetchUsage() {
 }
 
 /** Sends the percentages to the server; with `everySeconds`, not more often than that. */
-async function reportUsage(server, token, { everySeconds = 0, print = false } = {}) {
+/**
+ * After a 429 from Anthropic the next asks wait: 2, 4, 8 … minutes, 30 at most, and a success starts again
+ * from the minute. Asking on through a 429 only keeps the limit on.
+ */
+const backoffOf = async () => readState('usage-backoff');
+async function noteUsageAnswer(error) {
+  if (error === 'http-429') {
+    const tries = ((await backoffOf()).tries ?? 0) + 1;
+    await writeState('usage-backoff', { tries, until: Date.now() + Math.min(30, 2 ** tries) * 60_000 }).catch(() => {});
+  } else if (!error) {
+    await writeState('usage-backoff', {}).catch(() => {});
+  }
+}
+
+async function reportUsage(server, token, { everySeconds = 0, print = false, waitOut = true } = {}) {
+  if (waitOut && ((await backoffOf()).until ?? 0) > Date.now()) return { error: 'backoff' };
   if (everySeconds) {
     try {
       const last = JSON.parse(await readFile(usageState, 'utf8')).at ?? 0;
@@ -388,6 +408,7 @@ async function reportUsage(server, token, { everySeconds = 0, print = false } = 
   }
 
   const usage = await fetchUsage();
+  await noteUsageAnswer(usage.error);
   if (print) {
     if (usage.error === 'no-key') console.log(say('noKey'));
     else if (usage.error) console.log(say('noAnthropic', { error: usage.error }));
@@ -410,7 +431,8 @@ async function reportUsage(server, token, { everySeconds = 0, print = false } = 
 async function usageCommand() {
   const { server, token } = serverAndToken();
   console.log(say('limitsTitle'));
-  const result = await reportUsage(server, token, { print: true }).catch((error) => ({ failed: error.cause?.code ?? error.message }));
+  // Asked by hand: tried even while the hooks wait out a 429.
+  const result = await reportUsage(server, token, { print: true, waitOut: false }).catch((error) => ({ failed: error.cause?.code ?? error.message }));
   if (result?.email) console.log(say('account', { email: result.email }));
   if (result?.sent) console.log(say('sentToPanel'));
   else if (result?.failed) failLater(say('notSentServer', { error: result.failed }));
@@ -486,19 +508,46 @@ async function warnRejected() {
 }
 
 /**
- * What runs beside the hooks without holding them up: the exact percentages (once a minute), and in a detached
- * process the logs read again for what telemetry lost and a newer agent from the server.
+ * What runs beside the hooks, in a detached process so it never holds them up: the exact percentages (once a
+ * minute), and once an hour the logs read again for what telemetry lost and a newer agent from the server.
+ * A hook waits only for the server's answer: asking Anthropic as well could take it past Claude Code's hook
+ * timeout, and a hook that times out (or falls over) lets the prompt through even on a stopped computer.
  */
-async function sideWork(server, token) {
-  const usage = reportUsage(server, token, { everySeconds: REPORT_SECONDS }).catch(() => null);
+async function sideWork() {
+  const now = Date.now();
+  await writeState('active', { at: now }).catch(() => {});
   const state = await readState('background');
-  if (Date.now() - (state.at ?? 0) > CATCH_UP_SECONDS * 1000) {
-    await writeState('background', { ...state, at: Date.now() }).catch(() => {});
-    const { spawn } = await import('node:child_process');
-    spawn(process.execPath, [agentCopy, 'background'], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+  const catchUp = now - (state.at ?? 0) > CATCH_UP_SECONDS * 1000;
+  // A poller already running keeps the percentages coming: no second one; nor while a 429 is waited out.
+  const polling = ((await readState('poller')).until ?? 0) > now;
+  const waiting = ((await backoffOf()).until ?? 0) > now;
+  const usage = !polling && !waiting && now - ((await readState('usage-sent')).at ?? 0) >= REPORT_SECONDS * 1000;
+  if (!catchUp && !usage) return;
+  // Claimed before the start, so hooks running at the same moment do not start one each.
+  if (catchUp) await writeState('background', { ...state, at: now }).catch(() => {});
+  if (usage) await writeState('usage-sent', { at: now }).catch(() => {});
+  const { spawn } = await import('node:child_process');
+  spawn(process.execPath, [agentCopy, catchUp ? 'background' : 'side'], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+}
+
+/**
+ * Started detached by a hook: the exact percentages every REPORT_SECONDS while Claude Code is in use and for
+ * ACTIVE_SECONDS after, so the dashboard keeps up whether or not an answer just ended. It stops early when
+ * there is nothing to send (no sign-in here) or the server will not take it.
+ */
+async function side() {
+  const { server, token } = await hookServer();
+  if (!server || !token) return;
+  for (;;) {
+    await writeState('poller', { pid: process.pid, until: Date.now() + (REPORT_SECONDS + 15) * 1000 }).catch(() => {});
+    const result = await reportUsage(server, token).catch(() => null);
+    // Nothing to send, an error (Anthropic or the server), or not taken: the next hook starts it again.
+    if (!result || result.error || result.sent === false) break;
+    if (Date.now() - ((await readState('active')).at ?? 0) > ACTIVE_SECONDS * 1000) break;
+    await new Promise((resolve) => setTimeout(resolve, REPORT_SECONDS * 1000));
   }
 
-  await usage;
+  await writeState('poller', {}).catch(() => {});
 }
 
 // ---------- the dashboard's rules: models and effort ----------
@@ -610,9 +659,8 @@ async function gate() {
   const input = await hookInput();
   const { server, token } = await hookServer();
   if (!server || !token) return;
-  const side = sideWork(server, token);
+  await sideWork().catch(() => {});
   const answer = await askGate(server, token);
-  await side;
   if (answer?.rejected) {
     const notice = await warnRejected();
     if (notice) process.stdout.write(JSON.stringify({ systemMessage: notice }));
@@ -640,9 +688,8 @@ async function guard() {
   const input = await hookInput();
   const { server, token } = await hookServer();
   if (!server || !token) return;
-  const side = sideWork(server, token);
+  await sideWork().catch(() => {});
   const answer = await askGate(server, token, { reuseSeconds: GUARD_SECONDS });
-  await side;
   if (answer?.rejected) return;
   if (answer?.allowed === false) {
     const reason = stopMessage(answer);
@@ -699,13 +746,14 @@ async function switched() {
 // At the end of each answer (Stop): the percentages and the side work. It never stops anything.
 async function report() {
   const { server, token } = await hookServer();
-  if (server && token) await sideWork(server, token);
+  if (server && token) await sideWork().catch(() => {});
 }
 
 /** Started detached by a hook: the logs again since the last time, then a newer agent if the server has one. */
 async function background() {
   const { server, token } = await hookServer();
   if (!server || !token) return;
+  await reportUsage(server, token).catch(() => null);
   const state = await readState('background');
   // A little before the last round, to miss nothing; the first time two days back.
   const since = state.logsAt ? state.logsAt - 15 * 60_000 : Date.now() - 2 * 86_400_000;
@@ -923,7 +971,7 @@ async function sendLogs(server, token, since, quiet) {
   return { scanned, added, skipped };
 }
 
-const commands = { setup, update, import: importHistory, watch, usage: usageCommand, status, remove, gate, guard, report, background, session, model: modelSwitch, switched };
+const commands = { setup, update, import: importHistory, watch, usage: usageCommand, status, remove, gate, guard, report, background, side, session, model: modelSwitch, switched };
 if (!commands[command]) {
   console.log(say('usageLine'));
   process.exit(command ? 1 : 0);

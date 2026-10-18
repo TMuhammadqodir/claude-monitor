@@ -89,6 +89,15 @@ test('the agent stops a paused computer and keeps it to its models and effort', 
   const stopped = run('gate', { session_id: 's1' });
   assert.equal(stopped.code, 2);
   assert.match(stopped.err, /stopped from the dashboard/);
+  // Also when the minute's report to Anthropic is due: that goes to a detached process, so the hook neither
+  // waits for it (past Claude Code's timeout) nor falls over while it is under way; both let the prompt through.
+  for (let i = 0; i < 5; i++) {
+    rmSync(join(config, 'claude-monitor', 'usage-sent.json'), { force: true });
+    const started = Date.now();
+    assert.equal(run('gate', { session_id: 's1' }).code, 2);
+    assert.ok(Date.now() - started < 5000);
+  }
+
   const tool = JSON.parse(run('guard', { session_id: 's1' }).out);
   assert.equal(tool.continue, false);
   assert.equal(tool.hookSpecificOutput.permissionDecision, 'deny');
@@ -153,4 +162,24 @@ test('the owner is told when a request went past the rules; Claude Code’s own 
   checkPolicy(db, machine, [{ model: 'claude-opus-5-5', source: 'repl_main_thread', effort: 'high' }]);
   // One for the model, one for the effort, each once a day.
   assert.equal(db.prepare("SELECT count(*) AS n FROM alerts WHERE kind = 'policy'").get().n, 2);
+});
+
+import { exactUsage, saveExactUsage } from '../src/usage.mjs';
+
+test('between two reports the percentage moves with the requests since the last one', () => {
+  const db = openDb(':memory:');
+  const { hash, hint } = newToken();
+  db.prepare("INSERT INTO machines (name, token_hash, token_hint, color, created_at, account) VALUES ('pc', ?, ?, '#f00', ?, 'acc')").run(hash, hint, Date.now());
+  const machine = db.prepare('SELECT * FROM machines').get();
+  const now = Date.now();
+  const HOUR = 3_600_000;
+  const spend = (ts, cost) => db.prepare("INSERT INTO requests (machine_id, ts, model, cost, account, origin) VALUES (?, ?, 'claude-opus-5-5', ?, 'acc', 'test')").run(machine.id, ts, cost);
+  // $10 for 20%: half a dollar a percent.
+  spend(now - 2.5 * HOUR, 10);
+  saveExactUsage(db, machine, { account: 'acc', limits: [{ kind: 'five_hour', percent: 20, resetsAt: new Date(now + HOUR).toISOString() }] }, now - 2 * HOUR);
+  spend(now - HOUR, 1);
+  const machines = db.prepare('SELECT id, name, color, account FROM machines').all();
+  const five = exactUsage(db, now, { machines, settings: { timeZone: 'UTC', billingDay: '1' } })[0].limits.find((l) => l.kind === 'five_hour');
+  assert.equal(five.percent, 20);
+  assert.equal(Math.round(five.live), 22);
 });
