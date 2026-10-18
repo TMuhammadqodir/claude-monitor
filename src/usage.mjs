@@ -237,6 +237,22 @@ const toMinute = (value) => {
   return Number.isFinite(ms) ? new Date(Math.round(ms / 60_000) * 60_000).toISOString() : null;
 };
 
+/**
+ * Whether a machine may speak for the account: one its own telemetry or history named, or the one it already
+ * reported; any account while it has none yet. A machine's token is not a key to every account's numbers: it
+ * cannot move another account's percentages (and so stop, or let go, the machines that work on it).
+ */
+export function mayUseAccount(db, machineId, account) {
+  if (!account) return true;
+  const machine = db.prepare('SELECT account FROM machines WHERE id = ?').get(machineId);
+  if (!machine) return false;
+  if (!machine.account || machine.account === account) return true;
+  return Boolean(
+    db.prepare('SELECT 1 FROM requests WHERE machine_id = ? AND account = ? LIMIT 1').get(machineId, account) ||
+      db.prepare('SELECT 1 FROM usage_reports WHERE machine_id = ? AND account = ? LIMIT 1').get(machineId, account),
+  );
+}
+
 /** Keeps a report of the exact percentages a machine's agent read from Anthropic. */
 export function saveExactUsage(db, machine, body, now = Date.now()) {
   const limits = (Array.isArray(body?.limits) ? body.limits : [])

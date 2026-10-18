@@ -2,6 +2,7 @@
 // Claude Monitor agent: run once on each computer that uses Claude Code.
 //
 //   node agent.mjs setup  --server http://192.168.1.10:4318 --token cm_xxx   turn reporting and limits on, send the past
+//                         [--auto-update]                                    and take newer agents from the server
 //   node agent.mjs import --server http://192.168.1.10:4318 --token cm_xxx   send past usage from the logs again
 //   node agent.mjs watch  --server http://192.168.1.10:4318 --token cm_xxx   send the logs every few minutes
 //   node agent.mjs usage  --server http://192.168.1.10:4318 --token cm_xxx   show and send the subscription's exact percentages
@@ -10,10 +11,12 @@
 //   node agent.mjs remove                                                    turn everything off
 //   node agent.mjs gate   ...                                                (run by Claude Code before each prompt)
 //
+// The token can come from CLAUDE_MONITOR_TOKEN instead of --token, to keep it out of the shell's history.
+//
 // Only numbers are sent: tokens, models, times, session ids and the project folder's name. Never prompts,
 // answers, code or file contents.
 
-import { readFile, writeFile, readdir, stat, copyFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, readdir, stat, copyFile, mkdir, rename } from 'node:fs/promises';
 import { homedir, hostname, platform, arch } from 'node:os';
 import { basename, join } from 'node:path';
 import { createReadStream } from 'node:fs';
@@ -32,12 +35,18 @@ const settingsFile = join(configDir, 'settings.json');
 // The agent keeps a copy of itself here, so the prompt hook finds it wherever it was downloaded to.
 const agentHome = join(configDir, 'claude-monitor');
 const agentCopy = join(agentHome, 'agent.mjs').replaceAll('\\', '/');
-const isOurHook = (entry) => (entry?.hooks ?? []).some((hook) => String(hook.command ?? '').includes('claude-monitor') && /\s(gate|guard|report)\b/.test(String(hook.command)));
+const isOurHook = (entry) =>
+  (entry?.hooks ?? []).some((hook) => String(hook.command ?? '').includes('claude-monitor') && /\s(gate|guard|report|session|model|switched)\b/.test(String(hook.command)));
 
 // The hooks this agent adds: the limit check before each prompt; before each tool call the same check (so a
-// machine stopped from the dashboard stops in the middle of an answer too); and at the end of each answer the
-// exact percentages, so the dashboard keeps up during a long answer, not only per prompt.
-const HOOKS = { UserPromptSubmit: 'gate', PreToolUse: 'guard', Stop: 'report' };
+// machine stopped from the dashboard stops in the middle of an answer too); at the end of each answer the
+// exact percentages, so the dashboard keeps up during a long answer, not only per prompt; and the model a
+// session starts with or switches to, so a model the machine may not use is refused (PreModelSwitch needs
+// Claude Code 2.1.251 or later; an older one leaves those hooks out).
+const HOOKS = { UserPromptSubmit: 'gate', PreToolUse: 'guard', Stop: 'report', SessionStart: 'session', PreModelSwitch: 'model', PostModelSwitch: 'switched' };
+
+// The keys of Claude Code's settings that carry the dashboard's rules for this machine (see applyPolicy).
+const POLICY_KEYS = ['availableModels', 'enforceAvailableModels', 'maxEffortLevel'];
 
 // How often the exact percentages are sent at most; how long a limit answer is reused between tool calls;
 // how often the logs are read again for what telemetry lost; how often the server is asked for a newer agent.
@@ -114,6 +123,15 @@ const SAY = {
   watchAdded: ['{time}  +{n} so‘rov', '{time}  +{n} requests', '{time}  +{n} запросов'],
   watchDown: ['{time}  server bilan aloqa yo‘q ({error}), keyinroq yana urinadi', '{time}  no link to the server ({error}), trying again later', '{time}  нет связи с сервером ({error}), повтор позже'],
   progress: ['\r  {files} fayl, {added} yangi so‘rov...', '\r  {files} files, {added} new requests...', '\r  файлов: {files}, новых запросов: {added}...'],
+  stoppedTool: ['Claude Monitor bu amalni to‘xtatdi: kompyuter paneldan to‘xtatilgan yoki limiti tugagan. Foydalanuvchiga ayting va kuting.', 'Claude Monitor stopped this tool call: the computer is paused on the dashboard or over its limit. Tell the user and wait.', 'Claude Monitor остановил этот вызов: компьютер остановлен из панели или исчерпал лимит. Сообщите пользователю и подождите.'],
+  autoUpdateOn: ['  Avto-yangilash yoqildi: agent serverdagi yangi versiyani o‘zi oladi.', '  Auto-update is on: the agent takes newer versions from the server.', '  Автообновление включено: агент сам берёт новые версии с сервера.'],
+  autoUpdateHttp: ['  ⚠ Server HTTP orqali: tarmoqdagi boshqa odam agent o‘rniga o‘z kodini berishi mumkin. Avto-yangilashni faqat HTTPS yoki Tailscale bilan yoqing.', '  ⚠ The server is plain HTTP: someone on the network could hand over their own code as the agent. Turn auto-update on only over HTTPS or Tailscale.', '  ⚠ Сервер по HTTP: кто-то в сети может подменить агент своим кодом. Включайте автообновление только с HTTPS или Tailscale.'],
+  modelBlocked: ['Claude Monitor: bu kompyuterda {model} ishlatib bo‘lmaydi. Ruxsat etilgan modellar: {allowed}. Almashtiring: /model {first}', 'Claude Monitor: {model} may not be used on this computer. Allowed models: {allowed}. Switch with: /model {first}', 'Claude Monitor: на этом компьютере нельзя использовать {model}. Разрешённые модели: {allowed}. Переключитесь: /model {first}'],
+  effortBlocked: ['Claude Monitor: effort {level} bu kompyuter uchun chegaradan yuqori (ko‘pi bilan {max}). Pasaytiring: /effort {max}', 'Claude Monitor: effort {level} is above this computer’s cap (at most {max}). Lower it with: /effort {max}', 'Claude Monitor: effort {level} выше предела этого компьютера (не больше {max}). Понизьте: /effort {max}'],
+  statusPolicy: ['Qoida:  modellar: {models} · effort: {effort}', 'Rules:  models: {models} · effort: {effort}', 'Правила: модели: {models} · effort: {effort}'],
+  anyModel: ['hammasi', 'any', 'любые'],
+  noCap: ['chegarasiz', 'no cap', 'без предела'],
+  upTo: ['ko‘pi bilan {max}', 'at most {max}', 'не больше {max}'],
   usageLine: ['Foydalanish: node agent.mjs setup|update|import|watch|usage|status|remove --server http://manzil:4318 --token cm_...', 'Usage: node agent.mjs setup|update|import|watch|usage|status|remove --server http://address:4318 --token cm_...', 'Использование: node agent.mjs setup|update|import|watch|usage|status|remove --server http://адрес:4318 --token cm_...'],
 };
 
@@ -137,7 +155,7 @@ function failLater(message) {
 
 function serverAndToken() {
   const server = (option('server') ?? '').replace(/\/+$/, '');
-  const token = option('token') ?? '';
+  const token = option('token') ?? process.env.CLAUDE_MONITOR_TOKEN ?? '';
   if (!/^https?:\/\/[^/]+/.test(server)) fail(say('needServer'));
   if (!/^cm_[A-Za-z0-9_-]{20,}$/.test(token)) fail(say('needToken'));
   return { server, token };
@@ -193,6 +211,14 @@ async function setup() {
   await installHooks(settings);
   await writeFile(settingsFile, JSON.stringify(settings, null, 2) + '\n');
   console.log(say('settingsSaved', { file: settingsFile }));
+  // Taking code from the server is asked for, never assumed: whoever controls the server (or, over plain HTTP,
+  // the network) would otherwise run their code on this computer, where Claude Code's sign-in key is.
+  const autoUpdate = args.includes('--auto-update');
+  await writeState('config', { autoUpdate });
+  if (autoUpdate) {
+    console.log(say('autoUpdateOn'));
+    if (server.startsWith('http://')) console.log(say('autoUpdateHttp'));
+  }
 
   console.log(say('sendingPast'));
   const { scanned, added } = await sendLogs(server, token, 0, false);
@@ -399,7 +425,7 @@ async function usageCommand() {
 async function hookServer() {
   const env = (await readSettings()).env ?? {};
   const server = (option('server') ?? env.OTEL_EXPORTER_OTLP_ENDPOINT ?? '').replace(/\/+$/, '');
-  const token = option('token') ?? /Bearer\s+(\S+)/.exec(env.OTEL_EXPORTER_OTLP_HEADERS ?? '')?.[1] ?? '';
+  const token = option('token') ?? /Bearer\s+(\S+)/.exec(env.OTEL_EXPORTER_OTLP_HEADERS ?? '')?.[1] ?? process.env.CLAUDE_MONITOR_TOKEN ?? '';
   return { server, token };
 }
 
@@ -445,7 +471,9 @@ async function askGate(server, token, { reuseSeconds = 0 } = {}) {
   return answer;
 }
 
-const stopMessage = (answer) => answer.message || (answer.paused ? say('paused') : say('overLimit', { reason: answer.reason }));
+// What the server says is shown to the person, never handed to Claude, and only as one short line of text.
+const clean = (value) => String(value ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').trim().slice(0, 300);
+const stopMessage = (answer) => clean(answer.message) || (answer.paused ? say('paused') : say('overLimit', { reason: clean(answer.reason) }));
 
 const REJECTED = say('rejected');
 
@@ -473,8 +501,113 @@ async function sideWork(server, token) {
   await usage;
 }
 
+// ---------- the dashboard's rules: models and effort ----------
+//
+// The gate's answer carries them. They are written into Claude Code's own settings, so Claude Code keeps to
+// them itself: availableModels (with enforceAvailableModels, so "Default" follows the list too) and
+// maxEffortLevel, which runs any higher level at the cap. The hooks check them as well, for a session that
+// started before the rules came or on a model given by ANTHROPIC_MODEL.
+
+const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+const familyOf = (model) => {
+  const match = /(fable|mythos|opus|sonnet|haiku)/.exec(String(model ?? '').toLowerCase());
+  return match ? (match[1] === 'mythos' ? 'fable' : match[1]) : null;
+};
+// A model of no known family is not judged: the rules name families.
+const modelAllowed = (policy, model) => !policy?.models || familyOf(model) === null || policy.models.includes(familyOf(model));
+const effortAbove = (policy, level) => Boolean(policy?.maxEffort) && EFFORTS.includes(level) && EFFORTS.indexOf(level) > EFFORTS.indexOf(policy.maxEffort);
+
+/** What Claude Code passes a hook on stdin (JSON); {} when there is none. */
+async function hookInput() {
+  if (process.stdin.isTTY) return {};
+  const read = (async () => {
+    let data = '';
+    for await (const chunk of process.stdin) {
+      data += chunk;
+      if (data.length > 1_000_000) break;
+    }
+
+    return JSON.parse(data || '{}');
+  })().catch(() => ({}));
+  // Claude Code closes stdin once it has written; a hook run by hand without input does not wait for ever.
+  return Promise.race([read, new Promise((resolve) => setTimeout(() => resolve({}), 2000).unref())]);
+}
+
+/** Writes JSON over a file through a temporary one, so Claude Code never reads a half-written settings file. */
+async function writeJson(file, value) {
+  const temporary = `${file}.${process.pid}.tmp`;
+  await writeFile(temporary, JSON.stringify(value, null, 2) + '\n');
+  await rename(temporary, file);
+}
+
+/**
+ * Puts the rules into Claude Code's user settings when they changed; takes them out when the dashboard has
+ * none, as long as they are still what this agent wrote (a value the person set themselves stays).
+ */
+async function applyPolicy(policy) {
+  if (!policy) return;
+  let settings;
+  try {
+    settings = JSON.parse(await readFile(settingsFile, 'utf8'));
+  } catch {
+    // No settings, or not readable: nothing is written over them.
+    return;
+  }
+
+  const wanted = {
+    availableModels: policy.models ?? null,
+    enforceAvailableModels: policy.models ? true : null,
+    maxEffortLevel: policy.maxEffort ?? null,
+  };
+  const applied = await readState('policy');
+  let changed = false;
+  for (const key of POLICY_KEYS) {
+    const want = wanted[key];
+    if (want !== null) {
+      if (JSON.stringify(settings[key]) !== JSON.stringify(want)) {
+        settings[key] = want;
+        changed = true;
+      }
+    } else if (applied[key] !== undefined && JSON.stringify(settings[key]) === JSON.stringify(applied[key])) {
+      delete settings[key];
+      changed = true;
+    }
+  }
+
+  if (changed) await writeJson(settingsFile, settings);
+  const next = Object.fromEntries(POLICY_KEYS.filter((key) => wanted[key] !== null).map((key) => [key, wanted[key]]));
+  if (JSON.stringify(next) !== JSON.stringify(applied)) await writeState('policy', next);
+}
+
+/** The model each session runs on, as SessionStart and PostModelSwitch said (the 100 latest sessions). */
+async function rememberModel(session, model) {
+  if (!session || !model) return;
+  const models = await readState('models');
+  models[session] = { model: String(model).slice(0, 100), at: Date.now() };
+  const latest = Object.entries(models)
+    .sort((a, b) => b[1].at - a[1].at)
+    .slice(0, 100);
+  await writeState('models', Object.fromEntries(latest)).catch(() => {});
+}
+
+const modelOfSession = async (session) => (session ? ((await readState('models'))[session]?.model ?? null) : null);
+
+/** Why the rules stop this session now: its model or its effort; null when they do not. */
+async function policyStop(policy, input) {
+  if (!policy) return null;
+  const model = await modelOfSession(input.session_id);
+  if (model && !modelAllowed(policy, model)) {
+    return say('modelBlocked', { model, allowed: policy.models.join(', '), first: policy.models[0] });
+  }
+
+  const level = input.effort?.level;
+  if (effortAbove(policy, level)) return say('effortBlocked', { level, max: policy.maxEffort });
+  return null;
+}
+
 // Before each prompt (UserPromptSubmit). Exit 2 stops the prompt and Claude Code shows why.
 async function gate() {
+  const input = await hookInput();
   const { server, token } = await hookServer();
   if (!server || !token) return;
   const side = sideWork(server, token);
@@ -486,26 +619,81 @@ async function gate() {
     return;
   }
 
+  await applyPolicy(answer?.policy).catch(() => {});
   if (answer?.allowed === false) {
     process.stderr.write(stopMessage(answer) + '\n');
+    process.exitCode = 2;
+    return;
+  }
+
+  const stop = await policyStop(answer?.policy, input);
+  if (stop) {
+    process.stderr.write(stop + '\n');
     process.exitCode = 2;
   }
 }
 
 // Before each tool call (PreToolUse): a machine stopped from the dashboard, or over its limit, stops in the
-// middle of an answer too. "continue: false" ends Claude's turn; the reason is shown.
+// middle of an answer too; so does one on a model or an effort its rules do not allow. "continue: false" ends
+// Claude's turn; the reason is shown.
 async function guard() {
+  const input = await hookInput();
   const { server, token } = await hookServer();
   if (!server || !token) return;
   const side = sideWork(server, token);
   const answer = await askGate(server, token, { reuseSeconds: GUARD_SECONDS });
   await side;
-  if (answer?.allowed === false && !answer.rejected) {
+  if (answer?.rejected) return;
+  if (answer?.allowed === false) {
     const reason = stopMessage(answer);
     process.stdout.write(
-      JSON.stringify({ continue: false, stopReason: reason, hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } }),
+      // stopReason is for the person; Claude reads permissionDecisionReason, so it gets this agent's own words.
+      JSON.stringify({ continue: false, stopReason: reason, hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: say('stoppedTool') } }),
+    );
+    return;
+  }
+
+  const stop = await policyStop(answer?.policy, input);
+  if (stop) {
+    process.stdout.write(
+      JSON.stringify({ continue: false, stopReason: stop, hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: stop } }),
     );
   }
+}
+
+// When a session starts (SessionStart): its model is remembered, and the rules are put in place before the
+// first prompt. It cannot stop anything; a model the rules do not allow is said here and stopped at the prompt.
+async function session() {
+  const input = await hookInput();
+  await rememberModel(input.session_id, input.model);
+  const { server, token } = await hookServer();
+  if (!server || !token) return;
+  const answer = await askGate(server, token, { reuseSeconds: GUARD_SECONDS });
+  if (!answer || answer.rejected) return;
+  await applyPolicy(answer.policy).catch(() => {});
+  const stop = await policyStop(answer.policy, input);
+  if (stop) process.stdout.write(JSON.stringify({ systemMessage: stop }));
+}
+
+// Before a model switch (PreModelSwitch): a model the rules do not allow is refused (exit 2). An answer from
+// the last minute is used as it is; else the server is asked briefly, and when it does not answer the last
+// answer still decides. With none at all and no server, the switch goes on.
+async function modelSwitch() {
+  const input = await hookInput();
+  const { server, token } = await hookServer();
+  if (!server || !token) return;
+  const answer = (await askGate(server, token, { reuseSeconds: 60 })) ?? (await readState('gate')).answer;
+  const policy = answer?.rejected ? null : answer?.policy;
+  if (policy && !modelAllowed(policy, input.to_model)) {
+    process.stderr.write(say('modelBlocked', { model: input.to_model, allowed: policy.models.join(', '), first: policy.models[0] }) + '\n');
+    process.exitCode = 2;
+  }
+}
+
+// After a model switch (PostModelSwitch), the automatic ones too: the session's model is remembered.
+async function switched() {
+  const input = await hookInput();
+  await rememberModel(input.session_id, input.to_model);
 }
 
 // At the end of each answer (Stop): the percentages and the side work. It never stops anything.
@@ -529,7 +717,7 @@ async function background() {
     // Next time.
   }
 
-  if (Date.now() - (state.updateAt ?? 0) > UPDATE_SECONDS * 1000) {
+  if ((await readState('config')).autoUpdate === true && Date.now() - (state.updateAt ?? 0) > UPDATE_SECONDS * 1000) {
     state.updateAt = Date.now();
     await selfUpdate(server).catch(() => {});
   }
@@ -538,10 +726,12 @@ async function background() {
 }
 
 /**
- * Takes the server's agent when it differs from this one, and lets the new one set its hooks. Only a file
- * that looks like this agent and passes Node's syntax check replaces it.
+ * Only after "setup --auto-update": takes the server's agent when it differs from this one, and lets the new
+ * one set its hooks. Only a file that looks like this agent and passes Node's syntax check replaces it; that
+ * guards against a broken file, not a hostile server, which is why it has to be asked for.
  */
 async function selfUpdate(server) {
+  if ((await readState('config')).autoUpdate !== true) return false;
   const response = await fetch(`${server}/agent.mjs`, { signal: AbortSignal.timeout(15_000) });
   if (!response.ok) return false;
   const fresh = await response.text();
@@ -564,6 +754,12 @@ async function selfUpdate(server) {
 async function remove() {
   const settings = await readSettings();
   for (const key of KEYS) delete settings.env?.[key];
+  // The dashboard's rules go too, as long as they are still what this agent wrote.
+  const applied = await readState('policy');
+  for (const key of POLICY_KEYS) {
+    if (applied[key] !== undefined && JSON.stringify(settings[key]) === JSON.stringify(applied[key])) delete settings[key];
+  }
+
   if (settings.env && Object.keys(settings.env).length === 0) delete settings.env;
   removeOurHooks(settings);
   if (settings.hooks && Object.keys(settings.hooks).length === 0) delete settings.hooks;
@@ -597,6 +793,10 @@ async function status() {
   const { server, token } = await hookServer();
   const answer = server && token ? await askGate(server, token) : null;
   console.log(say('statusLink', { state: answer?.rejected ? say('linkRefused') : answer ? (answer.paused ? say('linkPaused') : say('linkOk')) : say('linkDown') }));
+  if (answer?.policy) {
+    const { models, maxEffort } = answer.policy;
+    console.log(say('statusPolicy', { models: models ? models.join(', ') : say('anyModel'), effort: maxEffort ? say('upTo', { max: maxEffort }) : say('noCap') }));
+  }
 }
 
 
@@ -723,7 +923,7 @@ async function sendLogs(server, token, since, quiet) {
   return { scanned, added, skipped };
 }
 
-const commands = { setup, update, import: importHistory, watch, usage: usageCommand, status, remove, gate, guard, report, background };
+const commands = { setup, update, import: importHistory, watch, usage: usageCommand, status, remove, gate, guard, report, background, session, model: modelSwitch, switched };
 if (!commands[command]) {
   console.log(say('usageLine'));
   process.exit(command ? 1 : 0);

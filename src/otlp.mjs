@@ -34,7 +34,29 @@ const number = (value) => {
   return Number.isFinite(n) ? n : 0;
 };
 
-const millisOf = (nanos) => (nanos ? Math.round(Number(BigInt(String(nanos)) / 1_000_000n)) : 0);
+// Counts and costs are never below zero: a negative cost would lower a machine's spending under its limit.
+const amount = (value) => Math.max(0, number(value));
+
+/**
+ * A text attribute as the database keeps it: a string (or number) cut to `max`, else null. A token holder
+ * could otherwise send megabytes in a model's name, or an array SQLite cannot store.
+ */
+export const text = (value, max = 200) =>
+  typeof value === 'string' ? value.slice(0, max) || null : typeof value === 'number' || typeof value === 'boolean' ? String(value).slice(0, max) : null;
+
+/** OTLP's nanoseconds as milliseconds; 0 when missing or not a whole number. */
+export function millisOf(nanos) {
+  if (!nanos) return 0;
+  try {
+    return Math.round(Number(BigInt(String(nanos)) / 1_000_000n));
+  } catch {
+    const n = Number(nanos);
+    return Number.isFinite(n) && n > 0 ? Math.round(n / 1_000_000) : 0;
+  }
+}
+
+// A moment more than a day ahead, or before 2020, is the sender's clock or a forgery: now is used instead.
+const sane = (ms) => (Number.isFinite(ms) && ms > 1_577_836_800_000 && ms < Date.now() + 86_400_000 ? ms : 0);
 
 /** The event's name without the "claude_code." prefix, e.g. "api_request". */
 export function eventName(record, attrs) {
@@ -44,7 +66,7 @@ export function eventName(record, attrs) {
 
 /** What a payload says about the machine itself: its system, version, terminal and account. */
 function describeMachine(db, machine, resource, attrs, ip) {
-  const pick = (...keys) => keys.map((key) => attrs[key] ?? resource[key]).find((value) => value != null && value !== '');
+  const pick = (...keys) => text(keys.map((key) => attrs[key] ?? resource[key]).find((value) => value != null && value !== ''), 120);
   db.prepare(
     `UPDATE machines SET last_seen_at = ?, last_ip = coalesce(?, last_ip),
        os = coalesce(?, os), arch = coalesce(?, arch), version = coalesce(?, version),
@@ -65,7 +87,7 @@ function describeMachine(db, machine, resource, attrs, ip) {
 
 /** The Claude account an event was made with, as Claude Code names it. */
 const accountIn = (resource, attrs) =>
-  ['user.account_uuid', 'user.account_id'].map((key) => attrs[key] ?? resource[key]).find((value) => value != null && value !== '') ?? null;
+  text(['user.account_uuid', 'user.account_id'].map((key) => attrs[key] ?? resource[key]).find((value) => value != null && value !== ''), 80);
 
 /**
  * Stores the events of an OTLP logs payload for the machine. Returns how many were kept and the API
@@ -101,45 +123,45 @@ export function ingestLogs(db, machine, payload, { ip, onLimit } = {}) {
           }
 
           const name = eventName(record, attrs);
-          const ts = Date.parse(attrs['event.timestamp']) || millisOf(record.timeUnixNano) || Date.now();
-          const session = attrs['session.id'] ?? null;
+          const ts = sane(Date.parse(attrs['event.timestamp'])) || sane(millisOf(record.timeUnixNano)) || Date.now();
+          const session = text(attrs['session.id'], 80);
           const project =
-            attrs['vcs.repository.name'] ?? resource['vcs.repository.name'] ?? (session ? projectOfSession.get(session)?.project : null) ?? null;
+            text(attrs['vcs.repository.name'] ?? resource['vcs.repository.name'], 120) ?? (session ? projectOfSession.get(session)?.project : null) ?? null;
 
           if (name === 'api_request') {
             const account = accountIn(resource, attrs);
-            rememberAccount(db, account, attrs['user.email'] ?? resource['user.email'] ?? null);
+            rememberAccount(db, account, text(attrs['user.email'] ?? resource['user.email'], 120));
             const usage = {
-              model: attrs.model ?? null,
-              input: number(attrs.input_tokens),
-              output: number(attrs.output_tokens),
-              cacheRead: number(attrs.cache_read_tokens),
-              cacheWrite: number(attrs.cache_creation_tokens),
-              speed: attrs.speed ?? null,
+              model: text(attrs.model, 80),
+              input: amount(attrs.input_tokens),
+              output: amount(attrs.output_tokens),
+              cacheRead: amount(attrs.cache_read_tokens),
+              cacheWrite: amount(attrs.cache_creation_tokens),
+              speed: text(attrs.speed, 20),
             };
             // Claude Code works out the cost itself; it is only priced here when it says nothing.
-            const cost = attrs.cost_usd != null ? number(attrs.cost_usd) : costOf(usage);
+            const cost = attrs.cost_usd != null ? amount(attrs.cost_usd) : costOf(usage);
             const result = insertRequest.run(
               machine.id,
               ts,
               session,
-              attrs.request_id ?? attrs.client_request_id ?? null,
+              text(attrs.request_id ?? attrs.client_request_id, 120),
               usage.model,
               usage.input,
               usage.output,
               usage.cacheRead,
               usage.cacheWrite,
               cost,
-              number(attrs.duration_ms) || null,
+              amount(attrs.duration_ms) || null,
               usage.speed,
-              attrs.query_source ?? null,
-              attrs.effort ?? null,
+              text(attrs.query_source, 40),
+              text(attrs.effort, 20),
               project,
               account,
             );
             if (result.changes > 0) {
               kept++;
-              requests.push({ machineId: machine.id, ts, session, account, ...usage, cost });
+              requests.push({ machineId: machine.id, ts, session, account, ...usage, cost, source: text(attrs.query_source, 40), effort: text(attrs.effort, 20) });
             }
 
             continue;
@@ -159,8 +181,8 @@ export function ingestLogs(db, machine, payload, { ip, onLimit } = {}) {
             continue;
           }
 
-          const [label, ok, text] = detail();
-          insertEvent.run(machine.id, ts, session, name, label ?? null, ok ?? null, number(attrs.duration_ms) || null, text?.trim() || null);
+          const [label, ok, said] = detail();
+          insertEvent.run(machine.id, ts, session, name, text(label, 120), ok ?? null, amount(attrs.duration_ms) || null, text(said, 300)?.trim() || null);
           kept++;
 
           // Too many requests: the subscription's limit was reached on this account.
@@ -226,7 +248,7 @@ export function ingestMetrics(db, machine, payload, { ip, timeZone } = {}) {
               described = true;
             }
 
-            const value = point.asDouble != null ? Number(point.asDouble) : Number(point.asInt ?? 0);
+            const value = number(point.asDouble ?? point.asInt ?? 0);
             let delta = value;
             if (cumulative) {
               const key = `${machine.id}|${metric.name}|${JSON.stringify(Object.entries(attrs).sort())}`;
@@ -240,9 +262,9 @@ export function ingestMetrics(db, machine, payload, { ip, timeZone } = {}) {
               continue;
             }
 
-            const kind = String(attrs.type ?? attrs.decision ?? attrs.model ?? '');
-            const day = dayOf(millisOf(point.timeUnixNano) || Date.now(), timeZone);
-            add.run(machine.id, day, name, name === 'tokens' ? `${attrs.type ?? ''}` : name === 'cost' ? '' : kind, delta);
+            const kind = text(attrs.type ?? attrs.decision ?? attrs.model, 80) ?? '';
+            const day = dayOf(sane(millisOf(point.timeUnixNano)) || Date.now(), timeZone);
+            add.run(machine.id, day, name, name === 'tokens' ? (text(attrs.type, 40) ?? '') : name === 'cost' ? '' : kind, delta);
             kept++;
           }
         }

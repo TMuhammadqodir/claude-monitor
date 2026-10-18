@@ -76,7 +76,10 @@ textarea {
 .boot {
   display: grid;
   place-items: center;
-  /* The spinner and its words stay together in the middle, not a half-screen apart. */
+  .model-picks { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 4px 0 12px; }
+.check.inline { display: inline-flex; align-items: center; gap: 6px; margin: 0; }
+
+/* The spinner and its words stay together in the middle, not a half-screen apart. */
   align-content: center;
   min-height: 100vh;
   color: var(--muted);

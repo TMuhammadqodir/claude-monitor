@@ -14,6 +14,21 @@ const MESSAGES = {
     en: '🔑 An attempt with an unknown token (IP {ip}). A deleted computer or a mistyped token, perhaps.',
     ru: '🔑 Попытка с неизвестным токеном (IP {ip}). Возможно, удалённый компьютер или неверно скопированный токен.',
   },
+  manyUnknownTokens: {
+    uz: '🔑 Bugun noma’lum tokenlar bilan juda ko‘p urinish bo‘ldi: bugun ular haqida boshqa xabar berilmaydi. Server internetga ochiq bo‘lsa, uni HTTPS va xavfsizlik devori ortiga qo‘ying.',
+    en: '🔑 Many attempts with unknown tokens today: no more of them are reported today. If the server is open to the internet, put it behind HTTPS and a firewall.',
+    ru: '🔑 Сегодня много попыток с неизвестными токенами: до конца дня о них больше не сообщается. Если сервер открыт в интернет, поставьте его за HTTPS и файрвол.',
+  },
+  policyModel: {
+    uz: '🚫 {name}: ruxsat etilmagan model ishlatildi ({model}). Ruxsat etilganlar: {allowed}. Agent hook’lari yoki Claude Code sozlamasi o‘zgartirilgan bo‘lishi mumkin.',
+    en: '🚫 {name}: a model it may not use was used ({model}). Allowed: {allowed}. The agent’s hooks or Claude Code’s settings may have been changed.',
+    ru: '🚫 {name}: использована неразрешённая модель ({model}). Разрешены: {allowed}. Возможно, изменены хуки агента или настройки Claude Code.',
+  },
+  policyEffort: {
+    uz: '🚫 {name}: effort chegaradan yuqori ishlatildi ({effort}, ko‘pi bilan {max}). Agent hook’lari yoki Claude Code sozlamasi o‘zgartirilgan bo‘lishi mumkin.',
+    en: '🚫 {name}: effort above its cap was used ({effort}, at most {max}). The agent’s hooks or Claude Code’s settings may have been changed.',
+    ru: '🚫 {name}: использован effort выше предела ({effort}, не больше {max}). Возможно, изменены хуки агента или настройки Claude Code.',
+  },
   firstContact: {
     uz: '🟢 {name} birinchi marta ulandi.',
     en: '🟢 {name} connected for the first time.',

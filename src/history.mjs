@@ -3,6 +3,7 @@
 
 import { costOf } from './pricing.mjs';
 import { inTransaction } from './db.mjs';
+import { text } from './otlp.mjs';
 
 const number = (value) => (Number.isFinite(Number(value)) ? Math.max(0, Math.round(Number(value))) : 0);
 
@@ -30,7 +31,8 @@ export function importRecords(db, machine, records, { ip, meta } = {}) {
         cacheWrite1h: number(record?.cacheWrite1h),
         speed: record?.speed === 'fast' ? 'fast' : null,
       };
-      if (!Number.isFinite(ts) || !id || usage.input + usage.output + usage.cacheRead + usage.cacheWrite === 0) {
+      // Before 2020 or more than a day ahead is no Claude Code log.
+      if (!Number.isFinite(ts) || ts < 1_577_836_800_000 || ts > Date.now() + 86_400_000 || !id || usage.input + usage.output + usage.cacheRead + usage.cacheWrite === 0) {
         skipped++;
         continue;
       }
@@ -65,7 +67,7 @@ export function importRecords(db, machine, records, { ip, meta } = {}) {
     db.prepare(
       `UPDATE machines SET last_ip = coalesce(?, last_ip), os = coalesce(?, os), arch = coalesce(?, arch),
          version = coalesce(?, version), last_seen_at = coalesce(last_seen_at, ?) WHERE id = ?`,
-    ).run(ip ?? null, meta?.os ?? null, meta?.arch ?? null, meta?.version ?? null, Date.now(), machine.id);
+    ).run(ip ?? null, text(meta?.os, 40), text(meta?.arch, 40), text(meta?.version, 40), Date.now(), machine.id);
   });
 
   return { added, skipped };

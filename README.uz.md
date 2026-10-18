@@ -61,10 +61,20 @@ bunga yaramaydi: Claude Code telemetriyani faqat foydalanuvchi sozlamasidan olad
 | `UserPromptSubmit` → `gate` | har prompt oldidan | kompyuter to'xtatilgan yoki limiti tugagan bo'lsa, promptni to'xtatadi |
 | `PreToolUse` → `guard` | har asbob chaqiruvi oldidan | xuddi shu tekshiruv (javob 10 soniya eslab qolinadi): Claude javob o'rtasida ham to'xtaydi |
 | `Stop` → `report` | har javob oxirida | aniq foizlarni yuboradi (ko'pi bilan daqiqada bir) |
+| `SessionStart` → `session` | sessiya boshlanganda | uning modelini eslab qoladi va kompyuter qoidalarini o'rnatadi |
+| `PreModelSwitch` → `model` | `/model` almashishidan oldin | ruxsat etilmagan modelga o'tishni rad etadi |
+| `PostModelSwitch` → `switched` | model almashgandan keyin | sessiyaning yangi modelini eslab qoladi |
+
+**Modellar va effort.** Paneldagi kompyuter sozlamasida u ishlatishi mumkin bo'lgan model oilalarini (Fable,
+Opus, Sonnet, Haiku) belgilang va effort chegarasini tanlang. Agent ularni Claude Code foydalanuvchi
+sozlamasiga yozadi (`availableModels` + `enforceAvailableModels`, `maxEffortLevel`): Claude Code o'zi boshqa
+modellarni rad etadi va yuqoriroq effortni chegarada ishlatadi; hook'lar ham tekshiradi, baribir chegaradan
+o'tgan so'rov bo'lsa panel xabar beradi. Claude Code 2.1.251 yoki yangisi kerak. Claude Code'ning o'z kichik
+yordamchilari (sessiya nomi, veb sahifa) baribir Haiku ishlatishi mumkin.
 
 Har hook taxminan 0.1 soniya oladi va server ishlamasa, hech biri ishni to'xtatmaydi.
 
-**Agentni yangilash.** Agent o'zini o'zi yangilaydi (pastda). Qo'lda: yangi `agent.mjs` ni yuklab olib,
+**Agentni yangilash.** `setup --auto-update` bilan agent o'zini o'zi yangilaydi (pastda). Qo'lda: yangi `agent.mjs` ni yuklab olib,
 `node agent.mjs update` ni ishga tushiring — server va token sozlamadan olinadi. Claude Code hook'larni ishga
 tushganda o'qiydi, shuning uchun keyin uni qayta oching.
 
@@ -166,21 +176,38 @@ odamga bering. "Yangi havola" eskisini almashtiradi, "Havolani o'chirish" uni yo
 - **Yo'qolgan sarf.** Server o'chiq bo'lsa, kompyuter uxlab qolsa yoki token xato bo'lsa, telemetriya o'sha
   so'rovlarni yo'qotadi. Agent soatiga bir marta (fonda, Claude Code'ni kutdirmasdan) oxirgi loglarni qayta
   yuboradi: bo'shliqlar to'ladi, hech narsa ikki marta sanalmaydi.
-- **Yangilanish.** Agent har 6 soatda o'zini serverdagi `agent.mjs` bilan solishtiradi va farq bo'lsa, sintaksis
-  tekshiruvidan keyin yangisini olib, hook'larini sozlaydi.
+- **Yangilanish.** Faqat `--auto-update` bilan sozlanganda: agent har 6 soatda o'zini serverdagi `agent.mjs`
+  bilan solishtiradi va farq bo'lsa, sintaksis tekshiruvidan keyin yangisini olib, hook'larini sozlaydi. Sukut
+  bo'yicha o'chiq, chunki u server kodini Claude Code kaliti turgan kompyuterda ishga tushiradi: faqat ishonchli
+  serverda, HTTPS yoki Tailscale orqali yoqing.
 - **Rad etilgan token.** "Yangi token" dan keyin eskisini yuborayotgan kompyuter panel ogohlantirishlarida
   ko'rinadi; uning Claude Code'i soatiga bir marta buni aytadi, `node agent.mjs status` esa "Aloqa: ✗" ko'rsatadi.
 
 ## Xavfsizlik
 
-- Panel paroli scrypt bilan saqlanadi; sessiya cookie'si imzolangan (`HttpOnly`, `SameSite=Strict`). Bir
-  manzildan daqiqasiga 5 tadan ortiq urinish qabul qilinmaydi.
+- Panel paroli scrypt bilan saqlanadi; sessiya cookie'si imzolangan (`HttpOnly`, `SameSite=Strict`, HTTPS'da
+  `Secure`) va serverda saqlanadi, shuning uchun "Chiqish" uni hamma joyda tugatadi. Yangi parol hamma
+  sessiyalarni tugatadi va hozirgi parolni talab qiladi. Bir manzildan daqiqasiga 5 tadan ortiq urinish qabul
+  qilinmaydi.
 - Birinchi parolni faqat server oynasidagi sozlash kodini bilgan odam qo'ya oladi.
 - Proksi (Caddy, Nginx) ortida `TRUST_PROXY=1` bilan ishga tushiring: urinishlar haqiqiy manzil bo'yicha
-  sanaladi. Proksisiz qo'ymang, aks holda `X-Forwarded-For` ni soxtalashtirib chegarani aylanib o'tish mumkin.
-- Gzip so'rov ko'pi bilan 100 MB gacha ochiladi. Kompyuter tokenlari faqat xesh holida saqlanadi.
+  sanaladi (`X-Forwarded-For` dagi oxirgi manzil, uni proksi qo'shadi). Proksisiz qo'ymang. Proksi
+  `X-Forwarded-Proto: https` yubormasa, `COOKIE_SECURE=1` qo'ying.
+- Gzip so'rov ko'pi bilan 100 MB gacha ochiladi. Kompyuter tokenlari faqat xesh holida saqlanadi. Telemetriya
+  tekshiriladi: narx va sonlar noldan past bo'lmaydi, matnlar me'yoriy uzunlikda kesiladi.
+- Kompyuter tokeni faqat o'sha kompyuter nomidan gapiradi: u faqat o'z telemetriyasida ko'ringan akkauntlarning
+  foizlarini yubora oladi. Noma'lum tokenlar haqida kuniga ko'pi bilan 5 marta xabar beriladi.
+- Kompyuter limitlarini agent hook'lari ushlab turadi: kompyuter egasi hook'larni olib tashlashi mumkin, server
+  ishlamaganda esa hech narsa to'xtatilmaydi. Ular halol foydalanuvchini limitda ushlaydi, aylanib o'tmoqchi
+  bo'lgan odamni emas.
+- Baza (va `backups/`) parol xeshi, sessiya siri va Telegram tokenini saqlaydi: ma'lumot papkasini faqat server
+  foydalanuvchisiga qoldiring (Linux va macOS'da fayllar avtomatik faqat unga o'qiladigan qilinadi).
+- Aniq foizlar Anthropic'ning hujjatlanmagan `api/oauth/usage` manzilidan olinadi: u o'zgarishi mumkin.
 - Internet orqali serverni HTTPS ortiga qo'ying (masalan Caddy yoki Nginx), aks holda token va parol ochiq
   ketadi. Uy tarmog'i yoki Tailscale'da HTTP yetadi.
+- `node agent.mjs setup` tokenni `CLAUDE_MONITOR_TOKEN` dan ham oladi: u shell tarixida qolmaydi.
+- Eski yozuvlar tozalanadi: asbob hodisalari `EVENT_DAYS` (180) kundan keyin, ko'rilgan ogohlantirishlar 90
+  kundan keyin. So'rovlar saqlanadi, agar `KEEP_DAYS` necha kun saqlashni aytmasa.
 
 ## Doimiy ishlashi
 

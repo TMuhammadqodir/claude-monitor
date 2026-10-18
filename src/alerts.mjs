@@ -5,6 +5,7 @@ import { getSettings } from './db.mjs';
 import { dayOf } from './time.mjs';
 import { ACCOUNT, fallbackAccount, limitAmount, machineLimits } from './usage.mjs';
 import { limitName, msg } from './messages.mjs';
+import { effortAbove, modelAllowed, policyOf } from './policy.mjs';
 
 /** Records a notice once per key; returns whether it is new. */
 export function raise(db, { machineId = null, kind, message, key }) {
@@ -42,6 +43,38 @@ export function checkBudgets(db, machineIds) {
           ? msg(settings, 'budgetOver', { name: machine.name, limit: limitName(settings, item.label), spent: limitAmount(item, item.spent), max: limitAmount(item, item.limit), stop: machine.limit_block ? msg(settings, 'budgetStops') : '' })
           : msg(settings, 'budgetNear', { name: machine.name, limit: limitName(settings, item.label), percent: Math.round(item.share * 100), spent: limitAmount(item, item.spent), max: limitAmount(item, item.limit) }),
         key: `budget:${id}:${item.kind}:${over ? 'over' : 'near'}:${period}`,
+      });
+    }
+  }
+}
+
+/**
+ * After new requests: did one use a model or an effort the machine may not use? Claude Code itself keeps to
+ * the rules the agent wrote, so this means they were taken out; it is told once a day per model or level.
+ * Only the main conversation counts: Claude Code names its own small helpers' model (titles, web pages) itself.
+ */
+export function checkPolicy(db, machine, requests) {
+  const policy = policyOf(machine);
+  if (!policy.models && !policy.maxEffort) return;
+  const settings = getSettings(db);
+  const day = dayOf(Date.now(), settings.timeZone);
+  for (const request of requests) {
+    const main = !request.source || /main_thread/.test(request.source);
+    if (main && !modelAllowed(policy, request.model)) {
+      raise(db, {
+        machineId: machine.id,
+        kind: 'policy',
+        message: msg(settings, 'policyModel', { name: machine.name, model: request.model, allowed: policy.models.join(', ') }),
+        key: `policy:${machine.id}:model:${request.model}:${day}`,
+      });
+    }
+
+    if (effortAbove(policy, request.effort)) {
+      raise(db, {
+        machineId: machine.id,
+        kind: 'policy',
+        message: msg(settings, 'policyEffort', { name: machine.name, effort: request.effort, max: policy.maxEffort }),
+        key: `policy:${machine.id}:effort:${request.effort}:${day}`,
       });
     }
   }

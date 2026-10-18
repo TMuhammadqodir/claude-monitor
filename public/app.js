@@ -53,6 +53,24 @@ function tokens(value) {
 
 const count = (n) => (Number(n) || 0).toLocaleString('en-US').replace(/,/g, ' ');
 
+/** "16:12:43" in the browser's clock. */
+const clockTime = (ts) => new Date(ts).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+// The model families a machine can be kept to, and the effort caps (Claude Code's own names).
+const MODEL_FAMILIES = [
+  ['fable', 'Fable'],
+  ['opus', 'Opus'],
+  ['sonnet', 'Sonnet'],
+  ['haiku', 'Haiku'],
+];
+const EFFORT_LEVELS = [
+  ['max', 'chegarasiz'],
+  ['xhigh', 'xhigh gacha'],
+  ['high', 'high gacha'],
+  ['medium', 'medium gacha'],
+  ['low', 'faqat low'],
+];
+
 function ago(ts) {
   if (!ts) return t('hech qachon');
   const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
@@ -424,7 +442,7 @@ function accountCard(a, machines) {
       </div>
       ${extra.map((l) => `<div class="limit-row"><span>${h(t(l.label))}</span><span><b>${percent(l.percent / 100)}</b></span><div class="bar"><i style="width:${Math.min(100, l.percent)}%;--c:${shareColor(l.percent / 100)}"></i></div></div>`).join('')}
       ${splitTable(exact)}
-      <p class="faint sub-note">${t('Anthropic’dan, {when} (Claude Code’dagi /usage bilan bir xil). Kompyuterning ulushi uning shu davrdagi sarfidan.', { when: ago(exact.ts) })}${month ? ' ' + t('Oylik — taxmin: Anthropic’da oylik limit yo‘q, oy {n} haftalik limitga teng deb olinadi.', { n: month.weeks.toFixed(1) }) : ''}</p>
+      <p class="faint sub-note">${t('Anthropic’dan {clock} da olindi ({when}), Claude Code’dagi /usage bilan bir xil. Agent foizni Claude har javobni tugatganda yuboradi, ko‘pi bilan daqiqada bir marta: Claude ishlab turganda panel 1 daqiqagacha orqada qoladi, ishlamay turganda yangilanmaydi. Yangi 5 soatlik oyna boshida birinchi hisobot 0% bo‘lishi mumkin. Kompyuterning ulushi uning shu davrdagi sarfidan.', { clock: clockTime(exact.ts), when: ago(exact.ts) })}${month ? ' ' + t('Oylik — taxmin: Anthropic’da oylik limit yo‘q, oy {n} haftalik limitga teng deb olinadi.', { n: month.weeks.toFixed(1) }) : ''}</p>
     </div>`;
   }
 
@@ -835,6 +853,7 @@ function renderSettings() {
         <div class="field"><label for="telegramChat">Chat ID</label><input id="telegramChat" type="text" value="${h(s.telegramChat)}"></div>
         <button type="button" class="btn" data-action="telegram-test">${t("Sinov xabari")}</button>
         <h2 style="margin-top:22px">${t("Panel paroli")}</h2>
+        <div class="field"><label for="currentPassword">${t("Hozirgi parol")}</label><input id="currentPassword" type="password" autocomplete="current-password" placeholder="${t('faqat parolni o‘zgartirganda kerak')}"></div>
         <div class="field"><label for="newPassword">${t("Yangi parol")}</label><input id="newPassword" type="password" autocomplete="new-password" minlength="8" placeholder="${t('o‘zgartirmaslik uchun bo‘sh qoldiring')}"></div>
       </div>
       <div class="card" style="grid-column:1/-1;display:flex;gap:10px;flex-wrap:wrap;align-items:center">
@@ -962,6 +981,13 @@ async function openMachine(id) {
   const m = detail.machine;
   const card = state.data.machines.find((x) => x.id === id);
   const c = detail.counters;
+  let allowed = null;
+  try {
+    allowed = m.allowed_models ? JSON.parse(m.allowed_models) : null;
+  } catch {
+    allowed = null;
+  }
+
   const dialog = openDialog(
     `
     <div class="modal-head"><span class="dot" style="--c:${h(m.color)};width:14px;height:14px"></span><h2>${h(m.name)}</h2>
@@ -1024,6 +1050,11 @@ async function openMachine(id) {
               </select><span class="hint">${t("Masalan, do‘stingiz bu kompyuterda o‘z akkauntini ham ishlatsa, sizning akkauntingizni tanlang: limit va to‘xtatish faqat unga qo‘llanadi.")}</span></div>`
             : ''
         }
+        <h3 style="margin-top:8px">${t("Modellar va effort")} <span class="right">${t('hammasi belgilansa = cheklovsiz')}</span></h3>
+        <div class="model-picks">${MODEL_FAMILIES.map(([family, label]) => `<label class="check inline"><input type="checkbox" name="e-model" value="${family}" ${!allowed || allowed.includes(family) ? 'checked' : ''}><span>${label}</span></label>`).join('')}</div>
+        <div class="field"><label for="e-effort">${t("Effort chegarasi")}</label><select id="e-effort">
+          ${EFFORT_LEVELS.map(([level, label]) => `<option value="${level}" ${(m.max_effort ?? 'max') === level ? 'selected' : ''}>${t(label)}</option>`).join('')}
+        </select><span class="hint">${t("Agent bularni Claude Code sozlamasiga yozadi (availableModels, maxEffortLevel): ruxsat etilmagan modelga o‘tib bo‘lmaydi, effort chegaradan oshmaydi. Har prompt va asbob oldidan ham tekshiriladi. Claude Code 2.1.251+ kerak.")}</span></div>
         <label class="check"><input id="e-block" type="checkbox" ${m.limit_block ? 'checked' : ''}>
           <span><b>${t("Limit tugasa promptlarni to‘xtatish")}</b><br><span class="faint">${t("Claude Code har prompt oldidan serverdan so‘raydi (agent \"setup\" o‘rnatgan hook). Belgilanmasa, faqat 80% va 100% da ogohlantirish keladi. Server ishlamasa, promptlar to‘xtatilmaydi.")}</span></span></label>
         ${limitBars(card?.limits ?? [], false)}
@@ -1045,6 +1076,12 @@ async function openMachine(id) {
 
   dialog.querySelector('#machine-form').addEventListener('submit', async (event) => {
     event.preventDefault();
+    const picked = [...dialog.querySelectorAll('input[name="e-model"]:checked')].map((input) => input.value);
+    if (picked.length === 0) {
+      toast(t('Kamida bitta modelni belgilang (Claude’ni butunlay to‘xtatish uchun “To‘xtatish” bor)'));
+      return;
+    }
+
     try {
       await api(`/api/machines/${id}`, {
         method: 'PATCH',
@@ -1060,6 +1097,8 @@ async function openMachine(id) {
           ...(dialog.querySelector('#e-account') ? { limitAccount: dialog.querySelector('#e-account').value } : {}),
           color: dialog.querySelector('#e-color').value,
           note: dialog.querySelector('#e-note').value,
+          allowedModels: picked.length === MODEL_FAMILIES.length ? null : picked,
+          maxEffort: dialog.querySelector('#e-effort').value,
         },
       });
       toast(t('Saqlandi'));
@@ -1124,7 +1163,7 @@ function bindSettings() {
   form?.addEventListener('submit', async (event) => {
     event.preventDefault();
     const body = {};
-    for (const key of ['language', 'planName', 'planPrice', 'planAccount', 'billingDay', 'usdToUzs', 'windowHours', 'timeZone', 'chartDays', 'telegramToken', 'telegramChat', 'newPassword']) {
+    for (const key of ['language', 'planName', 'planPrice', 'planAccount', 'billingDay', 'usdToUzs', 'windowHours', 'timeZone', 'chartDays', 'telegramToken', 'telegramChat', 'newPassword', 'currentPassword']) {
       body[key] = form.querySelector('#' + key).value;
     }
 
@@ -1134,7 +1173,8 @@ function bindSettings() {
       await loadSettings();
       refresh();
     } catch (e) {
-      toast(e.data?.error === 'password' ? t('Parol kamida 8 belgi') : e.data?.error === 'timeZone' ? t('Vaqt mintaqasi noto‘g‘ri') : t('Saqlanmadi'));
+      const error = e.data?.error;
+      toast(error === 'currentPassword' ? t('Hozirgi parol noto‘g‘ri') : error === 'wait' ? t('Juda ko‘p urinish: bir daqiqa kuting') : error === 'password' ? t('Parol kamida 8 belgi') : error === 'timeZone' ? t('Vaqt mintaqasi noto‘g‘ri') : t('Saqlanmadi'));
     }
   });
 }

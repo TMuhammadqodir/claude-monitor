@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 const SCHEMA = `
@@ -113,6 +113,12 @@ CREATE TABLE IF NOT EXISTS accounts (
   seen_at INTEGER NOT NULL
 );
 
+-- The dashboard's signed-in sessions (the hash of each cookie's nonce): signing out ends one on the server.
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT PRIMARY KEY,
+  expires INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -122,14 +128,52 @@ CREATE TABLE IF NOT EXISTS settings (
 /** Opens (and creates when missing) the database file. */
 export function openDb(file) {
   if (file !== ':memory:') {
-    mkdirSync(dirname(file), { recursive: true });
+    mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   }
 
   const db = new DatabaseSync(file);
+  if (file !== ':memory:') keepPrivate(file);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
   db.exec(SCHEMA);
   migrate(db);
   return db;
+}
+
+/**
+ * The database holds the password's hash, the session secret and the Telegram token: on Linux and macOS only
+ * its owner may read it (Windows keeps a user's files to that user through the folder's own permissions).
+ */
+export function keepPrivate(file) {
+  if (process.platform === 'win32') return;
+  for (const path of [file, `${file}-wal`, `${file}-shm`]) {
+    try {
+      if (existsSync(path)) chmodSync(path, 0o600);
+    } catch {
+      // Not the owner: nothing to do about it here.
+    }
+  }
+}
+
+const DAY_MS = 86_400_000;
+
+/**
+ * Old rows that only grow the file: tool and prompt events after EVENT_DAYS (180 by default), alerts already
+ * seen after 90 days, the cumulative series of Claude Code runs long over. The requests themselves are the
+ * history and are kept, unless KEEP_DAYS asks for less.
+ */
+export function prune(db, now = Date.now(), env = process.env) {
+  const eventDays = Number(env.EVENT_DAYS) > 0 ? Number(env.EVENT_DAYS) : 180;
+  db.prepare('DELETE FROM events WHERE ts < ?').run(now - eventDays * DAY_MS);
+  db.prepare('DELETE FROM alerts WHERE seen = 1 AND ts < ?').run(now - 90 * DAY_MS);
+  // A series that started 60 days ago belongs to a Claude Code long closed (start 0 means "not known": kept).
+  db.prepare('DELETE FROM series WHERE start > 0 AND start < ?').run(now - 60 * DAY_MS);
+  db.prepare('DELETE FROM sessions WHERE expires < ?').run(now);
+  if (Number(env.KEEP_DAYS) > 0) {
+    const before = now - Number(env.KEEP_DAYS) * DAY_MS;
+    db.prepare('DELETE FROM requests WHERE ts < ?').run(before);
+    db.prepare('DELETE FROM limit_hits WHERE ts < ?').run(before);
+    db.prepare('DELETE FROM counters WHERE day < ?').run(new Date(before).toISOString().slice(0, 10));
+  }
 }
 
 // Columns added after the first version: an older database gets them on start.
@@ -150,6 +194,9 @@ const ADDED_COLUMNS = {
     old_token_hash: 'TEXT',
     // A link that shows this machine's own usage, without the password (see /share/…).
     share_token: 'TEXT',
+    // The model families the machine may use (a JSON list, none = every one) and its highest effort level.
+    allowed_models: 'TEXT',
+    max_effort: 'TEXT',
   },
   // The account a request was made with: one computer can switch between accounts.
   requests: {

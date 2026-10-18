@@ -9,15 +9,17 @@ import { gunzipSync } from 'node:zlib';
 import { randomBytes } from 'node:crypto';
 import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { openDb, getSettings, setSetting } from './src/db.mjs';
+import { openDb, getSettings, keepPrivate, prune, setSetting } from './src/db.mjs';
 import { ingestLogs, ingestMetrics } from './src/otlp.mjs';
 import { importRecords } from './src/history.mjs';
 import { overview, recentRequests, sessions, machineDetail, sharedView } from './src/stats.mjs';
-import { COOKIE, allowAttempt, checkPassword, hasPassword, isSignedIn, machineOf, newSession, newToken, presentedHash, setPassword } from './src/auth.mjs';
-import { checkBudgets, raise, recordLimit, sendTelegram } from './src/alerts.mjs';
+import { COOKIE, allowAttempt, checkPassword, endSession, hasPassword, isSignedIn, machineOf, newSession, newToken, presentedHash, setPassword } from './src/auth.mjs';
+import { checkBudgets, checkPolicy, raise, recordLimit, sendTelegram } from './src/alerts.mjs';
+import { EFFORTS, MODEL_FAMILIES, parseModels, policyOf } from './src/policy.mjs';
 import { exportCsv } from './src/export.mjs';
 import { LANGUAGES, limitName, msg, when } from './src/messages.mjs';
-import { accountEmails, breakdown, comparisons, exactUsage, fallbackAccount, limitAmount, limitLabel, machineLimits, periods, saveExactUsage, windowHistory } from './src/usage.mjs';
+import { accountEmails, breakdown, comparisons, exactUsage, fallbackAccount, limitAmount, limitLabel, machineLimits, mayUseAccount, periods, saveExactUsage, windowHistory } from './src/usage.mjs';
+import { clientAddress } from './src/net.mjs';
 
 const ROOT = fileURLToPath(new URL('.', import.meta.url));
 const PORT = Number(process.env.PORT) || 4318;
@@ -27,12 +29,20 @@ const db = openDb(DATA);
 const MAX_BODY = 20 * 1024 * 1024;
 const COLORS = ['#ff7a45', '#36cfc9', '#9254de', '#fadb14', '#52c41a', '#f759ab', '#40a9ff', '#ffa940', '#73d13d', '#b37feb', '#ff4d4f', '#13c2c2'];
 
-// The dashboards listening for new requests (server-sent events).
+// The dashboards listening for new requests (server-sent events): a few open tabs, not an unbounded number.
 const listeners = new Set();
+const MAX_LISTENERS = 50;
 
 function broadcast(event, data) {
   const message = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const response of listeners) {
+    // A dashboard that stopped reading (asleep, a dead link) is let go instead of piling up its messages here.
+    if (response.writableLength > 1024 * 1024) {
+      listeners.delete(response);
+      response.destroy();
+      continue;
+    }
+
     response.write(message);
   }
 }
@@ -85,14 +95,22 @@ async function readJson(request) {
   }
 }
 
-// Behind a proxy (Caddy, Nginx) set TRUST_PROXY=1 to take the address it passes on; without one anybody could
-// write any address there and get round the limit on password attempts.
+// Behind a proxy (Caddy, Nginx) set TRUST_PROXY=1 to take the address it passes on (see clientAddress);
+// without one anybody could write any address there and get round the limit on password attempts.
 const TRUST_PROXY = process.env.TRUST_PROXY === '1';
-const ipOf = (request) =>
-  String((TRUST_PROXY && request.headers['x-forwarded-for']) || request.socket.remoteAddress || '')
-    .split(',')[0]
-    .trim()
-    .replace(/^::ffff:/, '');
+const ipOf = (request) => clientAddress(request.headers['x-forwarded-for'], request.socket.remoteAddress, TRUST_PROXY);
+
+// The session cookie is marked Secure when the dashboard is reached over HTTPS: directly, through a trusted
+// proxy that says so, or always with COOKIE_SECURE=1.
+const isHttps = (request) =>
+  process.env.COOKIE_SECURE === '1' ||
+  Boolean(request.socket.encrypted) ||
+  (TRUST_PROXY && /^https$/i.test(String(request.headers['x-forwarded-proto'] ?? '').split(',').pop().trim()));
+const cookieFlags = (request) => `Path=/; HttpOnly; SameSite=Strict${isHttps(request) ? '; Secure' : ''}`;
+
+// Unknown tokens are told about once a day per address, and at most this many a day in all: scanners on the
+// internet (or one changing its IPv6 address) do not fill the alerts or the owner's Telegram.
+const UNKNOWN_TOKEN_ALERTS = 5;
 
 // Until the owner sets a password, setting it needs the code printed in this server's console: whoever reaches
 // the server first over the network cannot take the dashboard.
@@ -150,11 +168,16 @@ function refuse(request, response) {
       });
       broadcast('machines', stale.id);
     } else if (!stopped) {
-      raise(db, {
-        kind: 'token',
-        message: msg(getSettings(db), 'unknownToken', { ip: ipOf(request) }),
-        key: `unknown:${ipOf(request)}:${day}`,
-      });
+      const today = db.prepare("SELECT count(*) AS n FROM alerts WHERE key LIKE 'unknown:%' AND key LIKE ?").get(`%:${day}`).n;
+      if (today < UNKNOWN_TOKEN_ALERTS) {
+        raise(db, {
+          kind: 'token',
+          message: msg(getSettings(db), 'unknownToken', { ip: ipOf(request) }),
+          key: `unknown:${ipOf(request)}:${day}`,
+        });
+      } else {
+        raise(db, { kind: 'token', message: msg(getSettings(db), 'manyUnknownTokens'), key: `unknown-many:${day}` });
+      }
     }
   }
 
@@ -184,6 +207,7 @@ async function receiveOtlp(request, response, kind) {
     const { requests } = ingestLogs(db, machine, payload, { ...options, onLimit: (m, hit) => recordLimit(db, m, hit) });
     if (requests.length > 0) {
       checkBudgets(db, [machine.id]);
+      checkPolicy(db, machine, requests);
       broadcast('requests', requests.length);
     }
   } else if (kind === 'metrics') {
@@ -219,26 +243,33 @@ async function api(request, response, url) {
     if (!machine) return refuse(request, response);
     // Stopped from the dashboard: nothing runs until it is let go.
     const settings = getSettings(db);
-    if (machine.paused) return send(response, 200, { allowed: false, reason: 'paused', paused: true, message: msg(settings, 'paused'), limits: [] });
+    // Which models and effort the machine may use: the agent writes them into Claude Code's settings.
+    const policy = policyOf(machine);
+    if (machine.paused) return send(response, 200, { allowed: false, reason: 'paused', paused: true, message: msg(settings, 'paused'), limits: [], policy });
     const { limits, over, block } = machineLimits(db, settings, machine);
     // A limit set for one account does not stop work on another: the agent says which account is in use,
     // else the machine's last request does.
+    // The account the agent names counts only when it is one this machine is known to use.
+    const named = url.searchParams.get('account');
     const inUse =
-      url.searchParams.get('account') ||
+      (named && mayUseAccount(db, machine.id, named) ? named : null) ||
       db.prepare('SELECT account FROM requests WHERE machine_id = ? AND account IS NOT NULL ORDER BY ts DESC LIMIT 1').get(machine.id)?.account ||
       null;
     const stops = block && !(machine.limit_account && inUse && inUse !== machine.limit_account);
     const reason = over.map((item) => `${limitName(settings, item.label)}: ${limitAmount(item, item.spent)} / ${limitAmount(item, item.limit)}`).join(', ');
-    return send(response, 200, { allowed: !stops, reason: stops ? reason : null, message: stops ? msg(settings, 'overLimit', { reason }) : null, limits });
+    return send(response, 200, { allowed: !stops, reason: stops ? reason : null, message: stops ? msg(settings, 'overLimit', { reason }) : null, limits, policy });
   }
 
   // The subscription's exact percentages, read by a machine's agent from Anthropic (only the numbers).
   if (pathname === '/api/limits' && method === 'POST') {
     const machine = machineOf(db, request.headers.authorization);
     if (!machine) return refuse(request, response);
-    const saved = saveExactUsage(db, machine, await readJson(request));
+    const body = await readJson(request);
     // The agent reporting is the machine being here, even before its next request.
     db.prepare('UPDATE machines SET last_seen_at = ?, last_ip = ? WHERE id = ?').run(Date.now(), ipOf(request), machine.id);
+    // Another account's numbers are not this machine's to give (until its own telemetry shows it working there).
+    if (typeof body?.account === 'string' && !mayUseAccount(db, machine.id, body.account.slice(0, 80))) return send(response, 403, { error: 'account' });
+    const saved = saveExactUsage(db, machine, body);
     if (!saved) return send(response, 400, { error: 'limits' });
     for (const limit of saved.limits) {
       if (limit.percent >= 90) {
@@ -259,7 +290,8 @@ async function api(request, response, url) {
   const shareMatch = /^\/api\/share\/([A-Za-z0-9_-]{20,})$/.exec(pathname);
   if (shareMatch && method === 'GET') {
     const machine = db.prepare('SELECT * FROM machines WHERE share_token = ?').get(shareMatch[1]);
-    if (!machine) return send(response, 404, { error: 'share' });
+    // A machine turned off on the dashboard has no page either.
+    if (!machine || machine.disabled) return send(response, 404, { error: 'share' });
     return send(response, 200, sharedView(db, getSettings(db), machine));
   }
 
@@ -272,20 +304,21 @@ async function api(request, response, url) {
     if (!allowAttempt(ipOf(request))) return send(response, 429, { error: 'wait' });
     const { password, code } = await readJson(request);
     if (String(code ?? '').trim().toLowerCase() !== setupCode) return send(response, 403, { error: 'code' });
-    if (typeof password !== 'string' || password.length < 8) return send(response, 400, { error: 'password' });
-    setPassword(db, password);
-    return signIn(response);
+    if (typeof password !== 'string' || password.length < 8 || password.length > 200) return send(response, 400, { error: 'password' });
+    await setPassword(db, password);
+    return signIn(request, response);
   }
 
   if (pathname === '/api/login' && method === 'POST') {
     if (!allowAttempt(ipOf(request))) return send(response, 429, { error: 'wait' });
     const { password } = await readJson(request);
-    if (!checkPassword(db, password)) return send(response, 401, { error: 'password' });
-    return signIn(response);
+    if (!(await checkPassword(db, password))) return send(response, 401, { error: 'password' });
+    return signIn(request, response);
   }
 
   if (pathname === '/api/logout' && method === 'POST') {
-    return send(response, 200, {}, { 'set-cookie': `${COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0` });
+    endSession(db, request.headers.cookie);
+    return send(response, 200, {}, { 'set-cookie': `${COOKIE}=; ${cookieFlags(request)}; Max-Age=0` });
   }
 
   // Everything else is the owner's.
@@ -322,7 +355,7 @@ async function api(request, response, url) {
       if (hit.window_cost > 0) limits.set(hit.account ?? fallback, hit.window_cost);
     }
 
-    const days = Math.min(30, Number(url.searchParams.get('days')) || 7);
+    const days = Math.min(30, Math.max(1, Number(url.searchParams.get('days')) || 7));
     const hours = Number(settings.windowHours) || 5;
     const exact = exactUsage(db, Date.now(), { machines, settings, fallback });
     const exactLimits = new Map();
@@ -349,14 +382,15 @@ async function api(request, response, url) {
   }
 
   if (pathname === '/api/requests' && method === 'GET') {
-    return send(response, 200, recentRequests(db, Math.min(200, Number(url.searchParams.get('limit')) || 40)));
+    return send(response, 200, recentRequests(db, Math.min(200, Math.max(1, Number(url.searchParams.get('limit')) || 40))));
   }
 
   if (pathname === '/api/sessions' && method === 'GET') {
-    return send(response, 200, sessions(db, { limit: Math.min(300, Number(url.searchParams.get('limit')) || 60) }));
+    return send(response, 200, sessions(db, { limit: Math.min(300, Math.max(1, Number(url.searchParams.get('limit')) || 60)) }));
   }
 
   if (pathname === '/api/stream' && method === 'GET') {
+    if (listeners.size >= MAX_LISTENERS) return send(response, 503, { error: 'busy' });
     response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
     response.write('retry: 5000\n\n');
     listeners.add(response);
@@ -369,7 +403,7 @@ async function api(request, response, url) {
   }
 
   if (pathname === '/api/export.csv' && method === 'GET') {
-    const days = Math.min(3650, Number(url.searchParams.get('days')) || 30);
+    const days = Math.min(3650, Math.max(1, Math.round(Number(url.searchParams.get('days'))) || 30));
     return send(response, 200, exportCsv(db, Date.now() - days * 86_400_000, settings.timeZone), {
       'content-type': 'text/csv; charset=utf-8',
       'content-disposition': `attachment; filename="claude-usage-${days}d.csv"`,
@@ -384,6 +418,16 @@ async function api(request, response, url) {
   if (pathname === '/api/settings' && method === 'PUT') {
     const body = await readJson(request);
     if (body.language !== undefined && !LANGUAGES.includes(body.language)) return send(response, 400, { error: 'language' });
+    // A new password is checked before anything is saved: a wrong current one changes nothing.
+    const changing = typeof body.newPassword === 'string' && body.newPassword.length > 0;
+    if (changing) {
+      if (body.newPassword.length < 8 || body.newPassword.length > 200) return send(response, 400, { error: 'password' });
+      // A dashboard left open is not enough to take it over: the password in use is asked for too (403, not
+      // 401, so the page does not take it for a lost sign-in).
+      if (!allowAttempt(ipOf(request))) return send(response, 429, { error: 'wait' });
+      if (!(await checkPassword(db, body.currentPassword))) return send(response, 403, { error: 'currentPassword' });
+    }
+
     const allowed = ['language', 'planName', 'planPrice', 'planAccount', 'billingDay', 'usdToUzs', 'windowHours', 'timeZone', 'chartDays', 'telegramChat', 'telegramToken'];
     for (const key of allowed) {
       if (body[key] === undefined || (key === 'telegramToken' && String(body[key]).startsWith('••••'))) continue;
@@ -398,10 +442,9 @@ async function api(request, response, url) {
       setSetting(db, key, String(body[key]).trim().slice(0, 200));
     }
 
-    if (typeof body.newPassword === 'string' && body.newPassword.length > 0) {
-      if (body.newPassword.length < 8) return send(response, 400, { error: 'password' });
-      setPassword(db, body.newPassword);
-      return signIn(response);
+    if (changing) {
+      await setPassword(db, body.newPassword);
+      return signIn(request, response);
     }
 
     return send(response, 200, { ok: true });
@@ -474,6 +517,18 @@ async function api(request, response, url) {
       if (body.note !== undefined) db.prepare('UPDATE machines SET note = ? WHERE id = ?').run(String(body.note).slice(0, 300) || null, id);
       if (body.color !== undefined && /^#[0-9a-f]{6}$/i.test(body.color)) db.prepare('UPDATE machines SET color = ? WHERE id = ?').run(body.color, id);
       if (body.disabled !== undefined) db.prepare('UPDATE machines SET disabled = ? WHERE id = ?').run(body.disabled ? 1 : 0, id);
+      // null, or every family, is "any model"; a list without one known family is refused, not taken as none.
+      if (body.allowedModels !== undefined) {
+        const models = body.allowedModels === null ? null : parseModels(body.allowedModels);
+        if (body.allowedModels !== null && !models) return send(response, 400, { error: 'models' });
+        db.prepare('UPDATE machines SET allowed_models = ? WHERE id = ?').run(models && models.length < MODEL_FAMILIES.length ? JSON.stringify(models) : null, id);
+      }
+
+      if (body.maxEffort !== undefined) {
+        if (body.maxEffort !== null && body.maxEffort !== '' && !EFFORTS.includes(body.maxEffort)) return send(response, 400, { error: 'effort' });
+        db.prepare('UPDATE machines SET max_effort = ? WHERE id = ?').run(body.maxEffort && body.maxEffort !== 'max' ? body.maxEffort : null, id);
+      }
+
       return send(response, 200, { ok: true });
     }
 
@@ -486,10 +541,10 @@ async function api(request, response, url) {
   return send(response, 404, { error: 'not found' });
 }
 
-function signIn(response) {
+function signIn(request, response) {
   const session = newSession(db);
   send(response, 200, { ok: true }, {
-    'set-cookie': `${COOKIE}=${encodeURIComponent(session.value)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${session.maxAge}`,
+    'set-cookie': `${COOKIE}=${encodeURIComponent(session.value)}; ${cookieFlags(request)}; Max-Age=${session.maxAge}`,
   });
 }
 
@@ -542,6 +597,7 @@ async function backUp() {
     const have = (await readdir(dir)).filter((name) => /^monitor-\d{4}-\d{2}-\d{2}\.db$/.test(name)).sort();
     if (!have.includes(file.split(/[\\/]/).pop())) {
       db.exec(`VACUUM INTO '${file.replaceAll("'", "''")}'`);
+      keepPrivate(file);
       have.push(file.split(/[\\/]/).pop());
     }
 
@@ -551,10 +607,25 @@ async function backUp() {
   }
 }
 
-backUp();
-setInterval(backUp, 6 * 3_600_000).unref();
+// Each round also clears out what only grows the file (see prune).
+async function maintain() {
+  try {
+    prune(db);
+  } catch (error) {
+    console.error(new Date().toISOString(), 'prune failed:', error.message);
+  }
+
+  await backUp();
+}
+
+maintain();
+setInterval(maintain, 6 * 3_600_000).unref();
 
 server.listen(PORT, HOST, () => {
+  if (process.env.MONITOR_DUMP) {
+    console.warn(`MONITOR_DUMP is on: every payload (emails and account ids too) is written to ${process.env.MONITOR_DUMP}. Turn it off when done.`);
+  }
+
   console.log(`Claude Monitor: http://localhost:${PORT}  (OTLP: http://<this-computer>:${PORT})`);
   if (!hasPassword(db)) {
     console.log(`The dashboard asks for a password on first visit. Setup code: ${setupCode}  (Sozlash kodi / Код настройки)`);

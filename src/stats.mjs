@@ -385,6 +385,12 @@ export function machineDetail(db, settings, id, now = Date.now()) {
  * What a machine's share link shows, without the password: its own spending, its limits and its part of each
  * account's limits. Nothing about the other machines but the account's total percentage.
  */
+/** "muhammad@gmail.com" → "mu•••@gmail.com". */
+export const maskEmail = (email) => {
+  const [name, domain] = String(email ?? '').split('@');
+  return email && domain ? `${name.slice(0, 2)}•••@${domain}` : null;
+};
+
 export function sharedView(db, settings, machine, now = Date.now()) {
   const tz = settings.timeZone;
   const from = startOfDay(now - 13 * 86_400_000, tz);
@@ -400,7 +406,8 @@ export function sharedView(db, settings, machine, now = Date.now()) {
   const machines = db.prepare('SELECT id, name, color, account FROM machines').all();
   const shares = exactUsage(db, now, { machines, settings })
     .map((e) => ({
-      email: e.email,
+      // Whoever has the link sees whose subscription it is, not the whole address.
+      email: maskEmail(e.email),
       limits: (e.split ?? [])
         .map((s) => ({ kind: s.kind, label: s.label, resetsAt: s.resetsAt, total: s.percent, mine: s.machines.find((m) => m.id === machine.id)?.percent ?? 0, cost: s.machines.find((m) => m.id === machine.id)?.cost ?? 0 }))
         .filter((l) => l.cost > 0),

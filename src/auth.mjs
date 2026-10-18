@@ -1,12 +1,15 @@
 // The owner's password for the dashboard, and the machines' tokens for sending their usage.
 
-import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
+import { promisify } from 'node:util';
 import { getSettings, setSetting } from './db.mjs';
 
 const SESSION_DAYS = 30;
 export const COOKIE = 'cm_session';
 
 const hash = (token) => createHash('sha256').update(token).digest('hex');
+// scrypt runs on Node's thread pool: a password being checked does not hold up the telemetry coming in.
+const derive = promisify(scrypt);
 
 /** A new machine token: shown once, kept only as its hash. */
 export function newToken() {
@@ -22,12 +25,12 @@ export function presentedHash(header) {
 
 /** The machine a request's "Authorization: Bearer cm_…" header names; null when none or disabled. */
 export function machineOf(db, header) {
-  const match = /^Bearer\s+(\S+)$/i.exec(String(header ?? '').trim());
-  if (!match) {
+  const presented = presentedHash(header);
+  if (!presented) {
     return null;
   }
 
-  const machine = db.prepare('SELECT * FROM machines WHERE token_hash = ?').get(hash(match[1]));
+  const machine = db.prepare('SELECT * FROM machines WHERE token_hash = ?').get(presented);
   return machine && !machine.disabled ? machine : null;
 }
 
@@ -45,46 +48,72 @@ export function hasPassword(db) {
   return Boolean(getSettings(db).passwordHash);
 }
 
-export function setPassword(db, password) {
+export async function setPassword(db, password) {
   const salt = randomBytes(16).toString('hex');
-  const derived = scryptSync(password, salt, 64).toString('hex');
+  const derived = (await derive(password, salt, 64)).toString('hex');
   setSetting(db, 'passwordHash', `${salt}:${derived}`);
-  // A new password ends every session signed with the old secret.
+  // A new password ends every session: the ones signed with the old secret, and every one kept.
   setSetting(db, 'secret', randomBytes(32).toString('hex'));
+  db.prepare('DELETE FROM sessions').run();
 }
 
-export function checkPassword(db, password) {
+export async function checkPassword(db, password) {
   const stored = getSettings(db).passwordHash;
   if (!stored || typeof password !== 'string') {
     return false;
   }
 
-  const [salt, expected] = stored.split(':');
-  const actual = scryptSync(password, salt, 64);
-  return timingSafeEqual(actual, Buffer.from(expected, 'hex'));
+  const [salt, expectedHex] = stored.split(':');
+  const expected = Buffer.from(expectedHex ?? '', 'hex');
+  if (!salt || expected.length !== 64) {
+    return false;
+  }
+
+  return timingSafeEqual(await derive(password, salt, 64), expected);
 }
 
-/** A signed session cookie value that ends in 30 days. */
-export function newSession(db) {
-  const expires = Date.now() + SESSION_DAYS * 86_400_000;
-  const body = `${expires}.${randomBytes(9).toString('base64url')}`;
+/**
+ * A signed session cookie value that ends in 30 days. The session is also kept (as its nonce's hash), so
+ * signing out ends it on the server, not only in the browser.
+ */
+export function newSession(db, now = Date.now()) {
+  const expires = now + SESSION_DAYS * 86_400_000;
+  const nonce = randomBytes(18).toString('base64url');
+  const body = `${expires}.${nonce}`;
   const signature = createHmac('sha256', secret(db)).update(body).digest('base64url');
+  db.prepare('DELETE FROM sessions WHERE expires < ?').run(now);
+  db.prepare('INSERT INTO sessions (id, expires) VALUES (?, ?)').run(hash(nonce), expires);
   return { value: `${body}.${signature}`, maxAge: SESSION_DAYS * 86_400 };
 }
 
-export function isSignedIn(db, cookieHeader) {
+/** The session's nonce when the cookie is signed, unexpired and still kept; else null. */
+function sessionOf(db, cookieHeader) {
   const value = parseCookies(cookieHeader)[COOKIE];
   if (!value) {
-    return false;
+    return null;
   }
 
   const [expires, nonce, signature] = value.split('.');
   if (!expires || !nonce || !signature || Number(expires) < Date.now()) {
-    return false;
+    return null;
   }
 
   const expected = createHmac('sha256', secret(db)).update(`${expires}.${nonce}`).digest('base64url');
-  return expected.length === signature.length && timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+  if (expected.length !== signature.length || !timingSafeEqual(Buffer.from(expected), Buffer.from(signature))) {
+    return null;
+  }
+
+  return db.prepare('SELECT 1 FROM sessions WHERE id = ? AND expires >= ?').get(hash(nonce), Date.now()) ? nonce : null;
+}
+
+export function isSignedIn(db, cookieHeader) {
+  return sessionOf(db, cookieHeader) !== null;
+}
+
+/** Signing out: the session stops working everywhere, even if its cookie was copied. */
+export function endSession(db, cookieHeader) {
+  const nonce = sessionOf(db, cookieHeader);
+  if (nonce) db.prepare('DELETE FROM sessions WHERE id = ?').run(hash(nonce));
 }
 
 export function parseCookies(header) {
@@ -92,18 +121,28 @@ export function parseCookies(header) {
   for (const part of String(header ?? '').split(';')) {
     const index = part.indexOf('=');
     if (index > 0) {
-      cookies[part.slice(0, index).trim()] = decodeURIComponent(part.slice(index + 1).trim());
+      try {
+        cookies[part.slice(0, index).trim()] = decodeURIComponent(part.slice(index + 1).trim());
+      } catch {
+        // A cookie that is not valid percent-encoding is not ours.
+      }
     }
   }
 
   return cookies;
 }
 
-// Wrong passwords from one address: five a minute, then it waits.
+// Password attempts from one address: five a minute, then it waits. Old entries go, so addresses that tried
+// once do not pile up in memory.
 const attempts = new Map();
 
-export function allowAttempt(ip) {
-  const now = Date.now();
+export function allowAttempt(ip, now = Date.now()) {
+  if (attempts.size > 1000) {
+    for (const [key, entry] of attempts) {
+      if (now - entry.start > 60_000) attempts.delete(key);
+    }
+  }
+
   const entry = attempts.get(ip) ?? { start: now, count: 0 };
   if (now - entry.start > 60_000) {
     entry.start = now;

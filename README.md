@@ -59,10 +59,20 @@ Claude Code takes telemetry settings only from the user settings. To undo: `node
 | `UserPromptSubmit` → `gate` | before each prompt | stops the prompt when the computer is stopped or over its limit |
 | `PreToolUse` → `guard` | before each tool call | the same check (answer reused for 10 s), so Claude stops in the middle of an answer too |
 | `Stop` → `report` | at the end of each answer | sends the exact percentages (at most once a minute) |
+| `SessionStart` → `session` | when a session starts | remembers its model and puts the machine's rules in place |
+| `PreModelSwitch` → `model` | before `/model` switches | refuses a model the machine may not use |
+| `PostModelSwitch` → `switched` | after a model switch | remembers the session's new model |
+
+**Models and effort.** In a computer's settings on the dashboard, tick the model families it may use (Fable,
+Opus, Sonnet, Haiku) and pick an effort cap. The agent writes them into Claude Code's user settings
+(`availableModels` with `enforceAvailableModels`, and `maxEffortLevel`), so Claude Code itself refuses other
+models and runs a higher effort at the cap; the hooks check them too, and the dashboard tells you if a request
+went past them anyway. Needs Claude Code 2.1.251 or later. Claude Code's own small helpers (session titles,
+web pages) may still use Haiku.
 
 Every hook takes about 0.1 s, and none of them stops work when the server is down.
 
-**Updating the agent.** The agent updates itself (see below). By hand: download the new `agent.mjs` and run
+**Updating the agent.** With `setup --auto-update` the agent updates itself (see below). By hand: download the new `agent.mjs` and run
 `node agent.mjs update` — the server and token are taken from the settings. Claude Code reads hooks when it
 starts, so reopen it afterwards.
 
@@ -163,21 +173,37 @@ person using the computer. "New link" replaces it, "Turn the link off" closes it
 - **Lost usage.** When the server is down, a computer sleeps or its token is wrong, telemetry loses those
   requests. Once an hour the agent (in the background, without holding up Claude Code) sends the recent logs
   again: the gaps fill, nothing counts twice.
-- **Updating.** Every 6 hours the agent compares itself with the server's `agent.mjs` and, when they differ,
-  takes the new one (after a syntax check) and lets it set its hooks.
+- **Updating.** Only when set up with `--auto-update`: every 6 hours the agent compares itself with the
+  server's `agent.mjs` and, when they differ, takes the new one (after a syntax check) and lets it set its
+  hooks. It is off by default because it runs the server's code on the computer, where Claude Code's sign-in
+  key is: turn it on only for a server you trust, over HTTPS or Tailscale.
 - **Refused token.** After "New token", a computer still sending the old one shows in the dashboard's alerts;
   its Claude Code says so once an hour, and `node agent.mjs status` shows "Link: ✗".
 
 ## Security
 
-- The dashboard password is kept with scrypt; the session cookie is signed (`HttpOnly`, `SameSite=Strict`).
-  More than 5 attempts a minute from one address are refused.
+- The dashboard password is kept with scrypt; the session cookie is signed (`HttpOnly`, `SameSite=Strict`, and
+  `Secure` over HTTPS) and kept on the server, so "Sign out" ends it everywhere. A new password ends every
+  session and needs the current one. More than 5 attempts a minute from one address are refused.
 - Only someone with the setup code from the server's window can set the first password.
-- Behind a proxy (Caddy, Nginx) start with `TRUST_PROXY=1` so attempts are counted per real address. Without a
-  proxy leave it off, or `X-Forwarded-For` could be forged to get round the limit.
-- Gzip bodies unpack to 100 MB at most. Machine tokens are kept only as hashes.
+- Behind a proxy (Caddy, Nginx) start with `TRUST_PROXY=1` so attempts are counted per real address (the last
+  one in `X-Forwarded-For`, the one the proxy adds). Without a proxy leave it off. If the proxy does not send
+  `X-Forwarded-Proto: https`, set `COOKIE_SECURE=1`.
+- Gzip bodies unpack to 100 MB at most. Machine tokens are kept only as hashes. Telemetry is checked: costs
+  and counts never go below zero, texts are cut to a sane length.
+- A machine's token speaks only for that machine: it can report the percentages only of accounts its own
+  telemetry shows it using. Unknown tokens are told about at most 5 times a day.
+- The machines' limits are kept by the agent's hooks: whoever runs a computer can take the hooks out, and
+  while the server cannot be reached nothing is stopped. They keep honest people within limits, not someone
+  set on getting round them.
+- The database (and `backups/`) holds the password's hash, the session secret and the Telegram token: keep
+  the data folder to the server's user (on Linux and macOS the files are made readable only by it).
+- The exact percentages come from Anthropic's `api/oauth/usage`, which is not a documented API: it may change.
 - Over the internet put the server behind HTTPS (e.g. Caddy or Nginx), or tokens and the password travel in
   the clear. On a home network or Tailscale, HTTP is enough.
+- `node agent.mjs setup` takes the token from `CLAUDE_MONITOR_TOKEN` too, to keep it out of the shell's history.
+- Old rows are cleared: tool events after `EVENT_DAYS` (180), seen alerts after 90 days. Requests are kept,
+  unless `KEEP_DAYS` says how many days to keep.
 
 ## Keeping it running
 
