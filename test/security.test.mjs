@@ -149,6 +149,11 @@ test('over HTTP: setup, sessions, password change, share links and account repor
   const { child, code, call } = await startServer();
   t.after(() => child.kill());
 
+  // The page and its files are served; nothing outside public/ is.
+  assert.equal((await call('/')).status, 200);
+  assert.equal((await call('/app.js')).status, 200);
+  assert.equal((await call('/../server.mjs')).status, 404);
+  assert.equal((await call('/%2e%2e/server.mjs')).status, 404);
   assert.equal((await call('/api/setup', { method: 'POST', body: { password: 'owner-password', code: 'nope' } })).status, 403);
   const setupAnswer = await call('/api/setup', { method: 'POST', body: { password: 'owner-password', code } });
   assert.equal(setupAnswer.status, 200);
@@ -162,6 +167,11 @@ test('over HTTP: setup, sessions, password change, share links and account repor
   const wrong = await call('/api/settings', { method: 'PUT', cookie, body: { planName: 'Changed', newPassword: 'taken-over-password', currentPassword: 'guess' } });
   assert.equal(wrong.status, 403);
   assert.notEqual((await call('/api/settings', { cookie })).body.planName, 'Changed');
+  // A number out of range is refused, and nothing of that request is saved.
+  const outOfRange = await call('/api/settings', { method: 'PUT', cookie, body: { planName: 'Half saved', windowHours: '-5' } });
+  assert.equal(outOfRange.status, 400);
+  assert.equal(outOfRange.body.error, 'windowHours');
+  assert.notEqual((await call('/api/settings', { cookie })).body.planName, 'Half saved');
   const changed = await call('/api/settings', { method: 'PUT', cookie, body: { newPassword: 'second-password', currentPassword: 'owner-password' } });
   assert.equal(changed.status, 200);
   assert.equal((await call('/api/overview', { cookie })).status, 401);
@@ -179,8 +189,24 @@ test('over HTTP: setup, sessions, password change, share links and account repor
   assert.equal((await call('/api/limits', { method: 'POST', token: machine.body.token, body: limits('mine') })).status, 200);
   assert.equal((await call('/api/limits', { method: 'POST', token: machine.body.token, body: limits('not-mine') })).status, 403);
 
+  // Spending that only comes from the logs (a Claude Code without telemetry) is held to the limits too.
+  await call(`/api/machines/${machine.body.id}`, { method: 'PATCH', cookie: signedIn, body: { budget: 0.01 } });
+  const imported = await call('/api/import', {
+    method: 'POST',
+    token: machine.body.token,
+    body: { records: [{ ts: new Date().toISOString(), requestId: 'req_import_1', model: 'claude-opus-5-5', input: 1000, output: 5000 }] },
+  });
+  assert.equal(imported.body.added, 1);
+  const budgetAlerts = (await call('/api/overview', { cookie: signedIn })).body.alerts.filter((a) => a.kind === 'budget');
+  assert.equal(budgetAlerts.length, 1);
+
+  // A DELETE or GET aimed at a machine's token or share link neither deletes the machine nor ends the link.
+  assert.equal((await call(`/api/machines/${machine.body.id}/token`, { method: 'DELETE', cookie: signedIn })).status, 405);
+  assert.equal((await call(`/api/machines/${machine.body.id}`, { cookie: signedIn })).status, 200);
+
   // A turned-off machine's share link stops working.
   const share = (await call(`/api/machines/${machine.body.id}/share`, { method: 'POST', cookie: signedIn })).body.share;
+  assert.equal((await call(`/api/machines/${machine.body.id}/share`, { cookie: signedIn })).status, 405);
   assert.equal((await call(`/api/share/${share}`)).status, 200);
   await call(`/api/machines/${machine.body.id}`, { method: 'PATCH', cookie: signedIn, body: { disabled: true } });
   assert.equal((await call(`/api/share/${share}`)).status, 404);
@@ -200,4 +226,87 @@ test('over HTTP: unknown tokens are reported a few times a day, not without end'
   const alerts = (await call('/api/overview', { cookie })).body.alerts.filter((a) => a.kind === 'token');
   // Five addresses, then one notice that more came.
   assert.equal(alerts.length, 6);
+});
+
+import { hitSpending, windowHistory, windowReports } from '../src/usage.mjs';
+
+test('a 429 is measured against what the account spent by then as known now, and Anthropic’s word wins', () => {
+  const db = openDb(':memory:');
+  const { hash, hint } = newToken();
+  db.prepare("INSERT INTO machines (name, token_hash, token_hint, color, created_at, account) VALUES ('pc', ?, ?, '#f00', ?, 'acc')").run(hash, hint, Date.now());
+  const machine = db.prepare('SELECT * FROM machines').get();
+  const HOUR = 3_600_000;
+  const now = Date.now();
+  const start = now - 3 * HOUR;
+  const spend = (ts, cost, origin) => db.prepare("INSERT INTO requests (machine_id, ts, model, cost, account, origin) VALUES (?, ?, 'claude-opus-5-5', ?, 'acc', ?)").run(machine.id, ts, cost, origin);
+  spend(start + 10 * 60_000, 10, 'otel');
+  db.prepare("INSERT INTO limit_hits (machine_id, ts, account, window_cost) VALUES (?, ?, 'acc', 10)").run(machine.id, start + HOUR);
+  // A session without telemetry arrives later through the logs: the limit was twice what was kept.
+  spend(start + 20 * 60_000, 10, 'import');
+  assert.equal(hitSpending(db, { account: 'acc', ts: start + HOUR }).window, 20);
+
+  // Without a report the window is measured against that limit, never past 100%.
+  spend(start + 30 * 60_000, 30, 'import');
+  const [measured] = windowHistory(db, { now, limits: new Map([['acc', 20]]) });
+  assert.equal(measured.share, 1);
+  assert.equal(measured.basis, 'limit');
+
+  // With a report made during the window, Anthropic's percentage is taken.
+  db.prepare("INSERT INTO usage_reports (ts, machine_id, account, limits) VALUES (?, ?, 'acc', ?)").run(
+    start + HOUR,
+    machine.id,
+    JSON.stringify([{ kind: 'five_hour', percent: 64, resetsAt: new Date(start + 5 * HOUR).toISOString() }]),
+  );
+  const [reported] = windowHistory(db, { now, limits: new Map([['acc', 20]]), reports: windowReports(db, 0) });
+  assert.equal(reported.share, 0.64);
+  assert.equal(reported.basis, 'reported');
+});
+
+import { anchoredWindow, machineLimits } from '../src/usage.mjs';
+import { windowsOf } from '../src/stats.mjs';
+
+test('the current window starts where Anthropic says, not where the gaps between requests suggest', () => {
+  const db = openDb(':memory:');
+  const { hash, hint } = newToken();
+  db.prepare("INSERT INTO machines (name, token_hash, token_hint, color, created_at, account, limit_window) VALUES ('pc', ?, ?, '#f00', ?, 'acc', 100)").run(hash, hint, Date.now());
+  const machine = db.prepare('SELECT * FROM machines').get();
+  const HOUR = 3_600_000;
+  const now = Date.now();
+  const spend = (ts, cost) => db.prepare("INSERT INTO requests (machine_id, ts, model, cost, account, origin) VALUES (?, ?, 'claude-opus-5-5', ?, 'acc', 'test')").run(machine.id, ts, cost);
+  spend(now - 4.5 * HOUR, 1);
+  spend(now - 3 * HOUR, 2);
+  spend(now - HOUR, 3);
+  const settings = { timeZone: 'UTC', billingDay: '1', windowHours: '5' };
+  // Guessed from the gaps, everything since 4.5 hours ago is one window.
+  assert.equal(machineLimits(db, settings, machine, now).limits.find((l) => l.kind === 'window').spent, 6);
+  // Anthropic says the window began 4 hours ago (it resets in one).
+  db.prepare("INSERT INTO usage_reports (ts, machine_id, account, limits) VALUES (?, ?, 'acc', ?)").run(
+    now - 10 * 60_000,
+    machine.id,
+    JSON.stringify([{ kind: 'five_hour', percent: 30, resetsAt: new Date(now + HOUR).toISOString() }]),
+  );
+  assert.equal(anchoredWindow(db, 'acc', now), now - 4 * HOUR);
+  const window = machineLimits(db, settings, machine, now).limits.find((l) => l.kind === 'window');
+  assert.equal(window.spent, 5);
+  assert.equal(window.resets, now + HOUR);
+  const open = windowsOf(db, now, 5, 'acc').find((w) => w.open);
+  assert.equal(open.cost, 5);
+  assert.equal(open.start, now - 4 * HOUR);
+});
+
+import { overview } from '../src/stats.mjs';
+
+test('a session seen only through the logs is pointed out on its computer', () => {
+  const db = openDb(':memory:');
+  const { hash, hint } = newToken();
+  db.prepare("INSERT INTO machines (name, token_hash, token_hint, color, created_at) VALUES ('pc', ?, ?, '#f00', ?)").run(hash, hint, Date.now());
+  const machine = db.prepare('SELECT * FROM machines').get();
+  const now = Date.now();
+  const add = (session, origin, project) =>
+    db.prepare("INSERT INTO requests (machine_id, ts, session_id, model, cost, origin, project) VALUES (?, ?, ?, 'claude-opus-5-5', 1, ?, ?)").run(machine.id, now - 60_000, session, origin, project);
+  add('with-telemetry', 'otel', 'a');
+  add('with-telemetry', 'import', 'a');
+  add('logs-only', 'import', 'b');
+  const [card] = overview(db, { timeZone: 'UTC', billingDay: '1', windowHours: '5', planPrice: '200' }, now).machines;
+  assert.deepEqual(card.logsOnly.map((s) => s.project), ['b']);
 });

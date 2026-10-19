@@ -2,7 +2,7 @@
 
 import { dayOf, hourOf, startOfDay, daysBetween, billingStart, weekStart } from './time.mjs';
 import { modelLabel } from './pricing.mjs';
-import { ACCOUNT, accountEmails, exactUsage, fallbackAccount, machineLimits } from './usage.mjs';
+import { ACCOUNT, accountEmails, anchoredWindow, exactUsage, fallbackAccount, hitSpending, machineLimits } from './usage.mjs';
 
 const HOUR = 3_600_000;
 const MINUTE = 60_000;
@@ -58,6 +58,22 @@ export function windowsOf(db, now, hours, fallback = fallbackAccount(db)) {
     state.tokens += row.tokens;
     state.requests++;
     state.machines[row.machineId] = (state.machines[row.machineId] ?? 0) + row.cost;
+  }
+
+  // Where Anthropic said when the account's window started, that start counts, not the one guessed from gaps.
+  for (const account of new Set(rows.map((row) => row.account))) {
+    const start = anchoredWindow(db, account, now, hours);
+    if (start === null) continue;
+    const state = { account, start, cost: 0, tokens: 0, requests: 0, machines: {} };
+    for (const row of rows) {
+      if (row.account !== account || row.ts < start) continue;
+      state.cost += row.cost;
+      state.tokens += row.tokens;
+      state.requests++;
+      state.machines[row.machineId] = (state.machines[row.machineId] ?? 0) + row.cost;
+    }
+
+    accounts.set(account, state);
   }
 
   return [...accounts.values()].map((state) => ({
@@ -116,6 +132,18 @@ export function overview(db, settings, now = Date.now()) {
       .all(now - 30 * MINUTE)
       .map((row) => [row.id, row]),
   );
+  // Sessions of the last six hours that reached the monitor only through the logs: a Claude Code opened before
+  // "setup", or still sending a token replaced since. Their spending shows up to ten minutes late.
+  const logsOnly = new Map();
+  for (const row of db
+    .prepare(
+      `SELECT machine_id AS id, session_id AS session, max(project) AS project, max(ts) AS last FROM requests
+       WHERE ts >= ? AND session_id IS NOT NULL GROUP BY machine_id, session_id HAVING sum(origin = 'otel') = 0 ORDER BY last DESC`,
+    )
+    .all(now - 6 * HOUR)) {
+    (logsOnly.get(row.id) ?? logsOnly.set(row.id, []).get(row.id)).push({ session: row.session, project: row.project, last: row.last });
+  }
+
   const lastModel = new Map(
     db
       .prepare('SELECT r.machine_id AS id, r.model FROM requests r JOIN (SELECT machine_id, max(ts) AS ts FROM requests GROUP BY machine_id) l ON l.machine_id = r.machine_id AND l.ts = r.ts')
@@ -148,6 +176,7 @@ export function overview(db, settings, now = Date.now()) {
       accounts: weekUse.filter((u) => u.id === m.id).map(({ account, email, cost, requests }) => ({ account, email, cost, requests })),
       model: lastModel.get(m.id) ? modelLabel(lastModel.get(m.id)) : null,
       session: openSessions.get(m.id) ?? null,
+      logsOnly: logsOnly.get(m.id) ?? [],
       today: t,
       week: weekBy.get(m.id) ?? zero,
       month: monthBy.get(m.id) ?? zero,
@@ -225,7 +254,14 @@ export function overview(db, settings, now = Date.now()) {
 
   const windowHours = Number(settings.windowHours) || 5;
   const windows = windowsOf(db, now, windowHours, fallback);
-  const hits = db.prepare('SELECT account, ts, window_cost AS windowCost, week_cost AS weekCost FROM limit_hits ORDER BY ts DESC LIMIT 20').all();
+  // What each 429 found spent, worked out now (see hitSpending), not as it was kept at the time.
+  const hits = db
+    .prepare('SELECT account, ts FROM limit_hits ORDER BY ts DESC LIMIT 20')
+    .all()
+    .map((hit) => {
+      const spent = hitSpending(db, hit, { hours: windowHours, fallback });
+      return { ...hit, windowCost: spent.window, weekCost: spent.week };
+    });
   const exact = exactUsage(db, now, { machines, settings, fallback });
   // Every account used this week or reported on, each with the machines that used it.
   const accountIds = [...new Set([...weekUse.map((u) => u.account), ...exact.map((e) => e.account), ...windows.filter((w) => w.open).map((w) => w.account)])];
@@ -381,16 +417,16 @@ export function machineDetail(db, settings, id, now = Date.now()) {
   };
 }
 
-/**
- * What a machine's share link shows, without the password: its own spending, its limits and its part of each
- * account's limits. Nothing about the other machines but the account's total percentage.
- */
 /** "muhammad@gmail.com" → "mu•••@gmail.com". */
 export const maskEmail = (email) => {
   const [name, domain] = String(email ?? '').split('@');
   return email && domain ? `${name.slice(0, 2)}•••@${domain}` : null;
 };
 
+/**
+ * What a machine's share link shows, without the password: its own spending, its limits and its part of each
+ * account's limits. Nothing about the other machines but the account's total percentage.
+ */
 export function sharedView(db, settings, machine, now = Date.now()) {
   const tz = settings.timeZone;
   const from = startOfDay(now - 13 * 86_400_000, tz);

@@ -105,7 +105,13 @@ export function msg(settings, key, values = {}) {
 }
 
 /** A limit's name in the settings' language. */
-export const limitName = (settings, label) => LIMIT_NAMES[label]?.[languageOf(settings)] ?? label;
+export function limitName(settings, label) {
+  const language = languageOf(settings);
+  if (LIMIT_NAMES[label]) return LIMIT_NAMES[label][language] ?? label;
+  // A window of another length than five hours ("4 soatlik", set in the settings).
+  const hours = /^(\d+) soatlik$/.exec(label)?.[1];
+  return hours && language !== 'uz' ? { en: `${hours}-hour`, ru: `${hours}-часовой` }[language] : label;
+}
 
 /** A moment as the settings' language writes it, in the settings' time zone. */
 export const when = (settings, ms) =>

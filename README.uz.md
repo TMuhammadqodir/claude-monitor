@@ -174,12 +174,15 @@ odamga bering. "Yangi havola" eskisini almashtiradi, "Havolani o'chirish" uni yo
 ## O'zini o'zi tuzatadi
 
 - **Yo'qolgan sarf.** Server o'chiq bo'lsa, kompyuter uxlab qolsa yoki token xato bo'lsa, telemetriya o'sha
-  so'rovlarni yo'qotadi. Agent soatiga bir marta (fonda, Claude Code'ni kutdirmasdan) oxirgi loglarni qayta
+  so'rovlarni yo'qotadi. Agent har 10 daqiqada (fonda, Claude Code'ni kutdirmasdan) oxirgi loglarni qayta
   yuboradi: bo'shliqlar to'ladi, hech narsa ikki marta sanalmaydi.
 - **Yangilanish.** Faqat `--auto-update` bilan sozlanganda: agent har 6 soatda o'zini serverdagi `agent.mjs`
   bilan solishtiradi va farq bo'lsa, sintaksis tekshiruvidan keyin yangisini olib, hook'larini sozlaydi. Sukut
   bo'yicha o'chiq, chunki u server kodini Claude Code kaliti turgan kompyuterda ishga tushiradi: faqat ishonchli
   serverda, HTTPS yoki Tailscale orqali yoqing.
+- **Telemetriyasiz sessiya.** `setup` dan oldin ochilgan (yoki almashtirilgan eski token bilan ishlayotgan)
+  Claude Code jonli ma'lumot yubormaydi; uning sarfi faqat loglardan, 10 daqiqagacha kechikib keladi. Kompyuter
+  kartasida "⚠ Telemetriyasiz: <loyiha>" chiqadi: o'sha Claude Code'ni bir marta yopib qayta oching.
 - **Rad etilgan token.** "Yangi token" dan keyin eskisini yuborayotgan kompyuter panel ogohlantirishlarida
   ko'rinadi; uning Claude Code'i soatiga bir marta buni aytadi, `node agent.mjs status` esa "Aloqa: ✗" ko'rsatadi.
 

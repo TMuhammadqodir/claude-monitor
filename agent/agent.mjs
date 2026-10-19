@@ -57,7 +57,9 @@ const REPORT_SECONDS = 60;
 // computer, claude.ai) moves them too, and the end of an answer is reported, not missed.
 const ACTIVE_SECONDS = 600;
 const GUARD_SECONDS = 10;
-const CATCH_UP_SECONDS = 3600;
+// A Claude Code opened before "setup" sends no telemetry: the logs are all the monitor sees of it, so they are
+// read often (only what changed, and a 170 MB log takes about a second).
+const CATCH_UP_SECONDS = 600;
 const UPDATE_SECONDS = 6 * 3600;
 
 // The keys this agent writes into Claude Code's user settings; "remove" takes exactly these out.
@@ -135,6 +137,9 @@ const SAY = {
   effortBlocked: ['Claude Monitor: effort {level} bu kompyuter uchun chegaradan yuqori (ko‘pi bilan {max}). Pasaytiring: /effort {max}', 'Claude Monitor: effort {level} is above this computer’s cap (at most {max}). Lower it with: /effort {max}', 'Claude Monitor: effort {level} выше предела этого компьютера (не больше {max}). Понизьте: /effort {max}'],
   statusPolicy: ['Qoida:  modellar: {models} · effort: {effort}', 'Rules:  models: {models} · effort: {effort}', 'Правила: модели: {models} · effort: {effort}'],
   anyModel: ['hammasi', 'any', 'любые'],
+  statusAuto: ['Yangilanish: {state}', 'Updates: {state}', 'Обновление: {state}'],
+  autoOn: ['serverdan o‘zi oladi', 'taken from the server by itself', 'само с сервера'],
+  autoOff: ['qo‘lda (node agent.mjs update)', 'by hand (node agent.mjs update)', 'вручную (node agent.mjs update)'],
   noCap: ['chegarasiz', 'no cap', 'без предела'],
   upTo: ['ko‘pi bilan {max}', 'at most {max}', 'не больше {max}'],
   usageLine: ['Foydalanish: node agent.mjs setup|update|import|watch|usage|status|remove --server http://manzil:4318 --token cm_...', 'Usage: node agent.mjs setup|update|import|watch|usage|status|remove --server http://address:4318 --token cm_...', 'Использование: node agent.mjs setup|update|import|watch|usage|status|remove --server http://адрес:4318 --token cm_...'],
@@ -214,7 +219,7 @@ async function setup() {
   };
 
   await installHooks(settings);
-  await writeFile(settingsFile, JSON.stringify(settings, null, 2) + '\n');
+  await writeJson(settingsFile, settings);
   console.log(say('settingsSaved', { file: settingsFile }));
   // Taking code from the server is asked for, never assumed: whoever controls the server (or, over plain HTTP,
   // the network) would otherwise run their code on this computer, where Claude Code's sign-in key is.
@@ -254,7 +259,7 @@ async function update() {
   const settings = await readSettings();
   await copyFile(settingsFile, `${settingsFile}.bak`).catch(() => {});
   await installHooks(settings);
-  await writeFile(settingsFile, JSON.stringify(settings, null, 2) + '\n');
+  await writeJson(settingsFile, settings);
   // Run by the agent's own update from the server: nobody is there to read it.
   if (args.includes('--quiet')) return;
   console.log(say('updated', { file: agentCopy }));
@@ -509,7 +514,7 @@ async function warnRejected() {
 
 /**
  * What runs beside the hooks, in a detached process so it never holds them up: the exact percentages (once a
- * minute), and once an hour the logs read again for what telemetry lost and a newer agent from the server.
+ * minute), and every 10 minutes the logs read again for what telemetry lost and a newer agent from the server.
  * A hook waits only for the server's answer: asking Anthropic as well could take it past Claude Code's hook
  * timeout, and a hook that times out (or falls over) lets the prompt through even on a stopped computer.
  */
@@ -584,9 +589,24 @@ async function hookInput() {
 
 /** Writes JSON over a file through a temporary one, so Claude Code never reads a half-written settings file. */
 async function writeJson(file, value) {
+  const text = JSON.stringify(value, null, 2) + '\n';
   const temporary = `${file}.${process.pid}.tmp`;
-  await writeFile(temporary, JSON.stringify(value, null, 2) + '\n');
-  await rename(temporary, file);
+  await writeFile(temporary, text);
+  // On Windows the swap fails while another program has the file open (Claude Code reading it): a moment later
+  // it goes through; if it never does, the file is written in place rather than not at all.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      await rename(temporary, file);
+      return;
+    } catch (error) {
+      if (!['EPERM', 'EBUSY', 'EACCES'].includes(error.code)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
+    }
+  }
+
+  await writeFile(file, text);
+  const { rm } = await import('node:fs/promises');
+  await rm(temporary, { force: true });
 }
 
 /**
@@ -753,7 +773,8 @@ async function report() {
 async function background() {
   const { server, token } = await hookServer();
   if (!server || !token) return;
-  await reportUsage(server, token).catch(() => null);
+  // Not again within the minute: the poller asks Anthropic too, and asking twice brings the 429 sooner.
+  await reportUsage(server, token, { everySeconds: REPORT_SECONDS }).catch(() => null);
   const state = await readState('background');
   // A little before the last round, to miss nothing; the first time two days back.
   const since = state.logsAt ? state.logsAt - 15 * 60_000 : Date.now() - 2 * 86_400_000;
@@ -811,7 +832,7 @@ async function remove() {
   if (settings.env && Object.keys(settings.env).length === 0) delete settings.env;
   removeOurHooks(settings);
   if (settings.hooks && Object.keys(settings.hooks).length === 0) delete settings.hooks;
-  await writeFile(settingsFile, JSON.stringify(settings, null, 2) + '\n');
+  await writeJson(settingsFile, settings);
   console.log(say('removed'));
 }
 
@@ -841,6 +862,7 @@ async function status() {
   const { server, token } = await hookServer();
   const answer = server && token ? await askGate(server, token) : null;
   console.log(say('statusLink', { state: answer?.rejected ? say('linkRefused') : answer ? (answer.paused ? say('linkPaused') : say('linkOk')) : say('linkDown') }));
+  console.log(say('statusAuto', { state: (await readState('config')).autoUpdate === true ? say('autoOn') : say('autoOff') }));
   if (answer?.policy) {
     const { models, maxEffort } = answer.policy;
     console.log(say('statusPolicy', { models: models ? models.join(', ') : say('anyModel'), effort: maxEffort ? say('upTo', { max: maxEffort }) : say('noCap') }));

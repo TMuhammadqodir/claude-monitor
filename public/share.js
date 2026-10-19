@@ -9,6 +9,12 @@ let data = null;
 
 const h = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
+/** A limit's label in the page's language: the server's names, and "N soatlik" for a window of any length. */
+const limitLabelText = (label) => {
+  const hours = /^(\d+) soatlik$/.exec(label)?.[1];
+  return hours && hours !== '5' ? t('{n} soatlik', { n: hours }) : t(label);
+};
+
 function money(value) {
   const n = Number(value) || 0;
   const d = n !== 0 && Math.abs(n) < 1 ? (Math.abs(n) < 0.01 ? 4 : 3) : 2;
@@ -83,7 +89,7 @@ function render() {
     .join('');
   const limits = data.limits
     .map(
-      (l) => `<div class="limit-row"><span>${h(t('{name} limit', { name: t(l.label) }).replace(/^./, (c) => c.toUpperCase()))}</span><span>${l.unit === '%' ? `${l.spent.toFixed(1)}% / ${l.limit}%` : `${money(l.spent)} / ${money(l.limit)}`} · <b>${percent(l.share)}</b></span>
+      (l) => `<div class="limit-row"><span>${h(t('{name} limit', { name: limitLabelText(l.label) }).replace(/^./, (c) => c.toUpperCase()))}</span><span>${l.unit === '%' ? `${l.spent.toFixed(1)}% / ${l.limit}%` : `${money(l.spent)} / ${money(l.limit)}`} · <b>${percent(l.share)}</b></span>
         <div class="bar"><i style="width:${Math.min(100, (l.share ?? 0) * 100)}%;--c:${shareColor(l.share ?? 0)}"></i></div></div>`,
     )
     .join('');

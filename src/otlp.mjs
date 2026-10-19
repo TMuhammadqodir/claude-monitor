@@ -80,7 +80,8 @@ function describeMachine(db, machine, resource, attrs, ip) {
     pick('app.version', 'service.version') ?? null,
     pick('terminal.type') ?? null,
     pick('user.email') ?? null,
-    pick('user.account_uuid', 'user.account_id', 'organization.id') ?? null,
+    // The account, as the requests and the agent's reports name it (an organization is not an account).
+    pick('user.account_uuid', 'user.account_id') ?? null,
     machine.id,
   );
 }

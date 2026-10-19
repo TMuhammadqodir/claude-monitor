@@ -53,6 +53,12 @@ function tokens(value) {
 
 const count = (n) => (Number(n) || 0).toLocaleString('en-US').replace(/,/g, ' ');
 
+/** A limit's label in the page's language: the server's names, and "N soatlik" for a window of any length. */
+const limitLabelText = (label) => {
+  const hours = /^(\d+) soatlik$/.exec(label)?.[1];
+  return hours && hours !== '5' ? t('{n} soatlik', { n: hours }) : t(label);
+};
+
 /** "16:12:43" in the browser's clock. */
 const clockTime = (ts) => new Date(ts).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
@@ -352,6 +358,11 @@ function machineCard(m) {
         ? `<span class="pill good">${t("● Sessiya")}</span> ${duration(Date.now() - m.session.started)} · ${money(m.session.cost)}`
         : `<span class="faint">${t('Oxirgi faollik: {when}', { when: ago(m.lastSeen) })}</span>`
     }</div>
+    ${
+      m.logsOnly?.length
+        ? `<div class="faint" style="font-size:12px;margin-top:6px" data-tip="${h(t('Bu sessiyalar telemetriya yubormayapti: ular “setup”dan oldin ochilgan yoki eski token bilan ishlayapti. Sarfi faqat loglardan, 10 daqiqagacha kechikib keladi. O‘sha Claude Code’ni bir marta yopib qayta oching.'))}">⚠ ${t('Telemetriyasiz: {list}', { list: h([...new Set(m.logsOnly.map((s) => s.project ?? '?'))].join(', ')) })}</div>`
+        : ''
+    }
     ${limitBars(m.limits, m.blocking)}
   </article>`;
 }
@@ -494,7 +505,7 @@ function limitBars(limits = [], blocking = false) {
   if (!limits.length) return '';
   return `<div class="budget">${limits
     .map(
-      (l) => `<div class="limit-row"><span>${h(t('{name} limit', { name: t(l.label) }).replace(/^./, (c) => c.toUpperCase()))}</span><span>${l.unit === '%' ? `${l.spent.toFixed(1)}% / ${l.limit}%` : `${money(l.spent)} / ${money(l.limit, 2)}`} · <b>${percent(l.share)}</b></span>
+      (l) => `<div class="limit-row"><span>${h(t('{name} limit', { name: limitLabelText(l.label) }).replace(/^./, (c) => c.toUpperCase()))}</span><span>${l.unit === '%' ? `${l.spent.toFixed(1)}% / ${l.limit}%` : `${money(l.spent)} / ${money(l.limit, 2)}`} · <b>${percent(l.share)}</b></span>
         <div class="bar"><i style="width:${Math.min(100, (l.share ?? 0) * 100)}%;--c:${shareColor(l.share ?? 0)}"></i></div></div>`,
     )
     .join('')}${blocking ? `<div class="faint" style="margin-top:6px">${t("🔒 Limit tugasa promptlar to‘xtatiladi")}</div>` : ''}</div>`;
@@ -606,7 +617,7 @@ function renderLimits() {
   const w = state.windows;
   if (!w) return `<h3 class="section-title">${t("⏱ Limitlar")}</h3><div class="card empty" style="margin-top:16px">${t("Yuklanmoqda…")}</div>`;
   const names = new Map(w.machines.map((m) => [m.id, m]));
-  const basisLimit = w.windows.some((x) => x.basis === 'limit' || x.basis === 'exact');
+  const basisLimit = w.windows.some((x) => x.basis === 'limit' || x.basis === 'exact' || x.basis === 'reported');
   // With several accounts each window says whose it is: every account has its own windows.
   const manyAccounts = new Set(w.windows.map((x) => x.account)).size > 1;
   const whose = (account) => accountName({ account, email: w.emails?.[account] });
@@ -617,11 +628,12 @@ function renderLimits() {
         <div class="win-bar"><div class="bar big"><i style="width:${Math.min(100, (x.share ?? 0) * 100)}%;--c:${x.basis === 'biggest' ? 'var(--info)' : shareColor(x.share ?? 0)}"></i></div>
           <div class="chips">${x.models.map((m) => `<span class="pill" data-tip="${h(`<b>${h(m.label)}</b>${t('Kiruvchi')} ${count(m.input)}<br>${t('Chiquvchi')} ${count(m.output)}<br>${t('Keshdan o‘qish')} ${count(m.cacheRead)}<br>${t('Keshga yozish')} ${count(m.cacheWrite)}`)}">${h(m.label)} ${money(m.cost)}</span>`).join('')}
           ${Object.entries(x.machines).map(([id, cost]) => `<span class="pill"><span class="dot" style="--c:${h(names.get(Number(id))?.color)}"></span>${h(names.get(Number(id))?.name ?? '?')} ${money(cost)}</span>`).join('')}</div></div>
-        <div class="win-num">${x.basis === 'biggest' ? `<b>${money(x.cost)}</b><div class="faint">${t("limit noma’lum")}</div>` : `<b>${percent(x.share)}</b><div>${money(x.cost)}</div>`}</div>
+        <div class="win-num">${x.basis === 'biggest' ? `<b>${money(x.cost)}</b><div class="faint">${t("limit noma’lum")}</div>` : `<b>${percent(x.share)}</b><div>${money(x.cost)}</div>${x.basis === 'reported' ? `<div class="faint">Anthropic</div>` : ''}`}</div>
       </div>`,
     )
     .join('');
   const basisExact = w.windows.some((x) => x.basis === 'exact');
+  const basisReported = w.windows.some((x) => x.basis === 'reported');
   const exactCards = w.exact.length
     ? subscriptionSection(w.exact.map((e) => ({ account: e.account, email: e.email, exact: e })), w.machines)
     : `<div class="card" style="margin-top:16px"><p class="muted" style="margin:0">${t('Claude Code’dagi /usage bilan bir xil aniq foiz uchun akkauntga kirgan kompyuterda bir marta {cmd} ni ishga tushiring. Keyin agent foizni o‘zi yuborib turadi (ko‘pi bilan daqiqada bir). Kirish kaliti kompyuterdan chiqmaydi: u faqat Anthropic’ga boradi, serverga faqat foizlar keladi.', { cmd: '<span class="mono">node agent.mjs usage --server … --token …</span>' })}</p></div>`;
@@ -631,6 +643,8 @@ function renderLimits() {
     <h3 class="section-title">${t("⏱ 5 soatlik oynalar")} <span class="pill">${t("oxirgi 7 kun")}</span></h3>
     <div class="card" style="margin-top:16px">
       <p class="muted" style="margin-top:0;font-size:13px">${
+        basisReported ? t('“Anthropic” belgili oynalarda foiz — Anthropic shu oyna uchun bergan oxirgi raqam (/usage dagi kabi). Qolganlari: ') : ''
+      }${
         basisExact
           ? t('Foiz: Anthropic bergan joriy oyna foizidan topilgan chegaraga nisbatan, ya’ni har oyna haqiqiy limitning qanchasini ishlatgani.')
           : basisLimit
@@ -921,6 +935,10 @@ function setupGuide(token, name) {
       <p class="muted" style="margin:0;font-size:13px">${t("Bu telemetriyani va limit tekshiruvini yoqadi hamda o‘tgan sarfni ham yuboradi.")}</p>
       <h4>${t("Claude Code’ni qayta oching")}</h4>
       <p class="muted" style="margin:4px 0 0;font-size:13px">${t("Shu bilan tamom: birinchi so‘rovdan keyin kompyuter panelda \"Ishlayapti\" bo‘ladi.")}</p>
+      <p class="faint" style="margin:4px 0 0;font-size:12px">${t("Ochiq turgan har bir Claude Code oynasini qayta oching: eskilari telemetriyani yubormaydi va kartada “Telemetriyasiz” deb ko‘rinadi.")}</p>
+      <h4>${t("Keyin yangilash")}</h4>
+      ${code(`node agent.mjs update`)}
+      <p class="muted" style="margin:0;font-size:13px">${t("Yangi agent.mjs ni yuqoridagidek yuklab oling va shuni ishga tushiring: server va token o‘zgarmaydi. Agent o‘zini o‘zi faqat “setup --auto-update” bilan yangilaydi.")}</p>
     </div>
     <details style="margin-top:16px"><summary class="muted">${t("Agentsiz, qo‘lda: ~/.claude/settings.json")}</summary>
       ${code(json)}
@@ -1180,6 +1198,9 @@ function bindSettings() {
       refresh();
     } catch (e) {
       const error = e.data?.error;
+      // A number out of its range names its field.
+      const field = error && form.querySelector(`label[for="${error}"]`)?.textContent;
+      if (field && error !== 'timeZone') return toast(t('Bu qiymat noto‘g‘ri: {name}', { name: field }));
       toast(error === 'currentPassword' ? t('Hozirgi parol noto‘g‘ri') : error === 'wait' ? t('Juda ko‘p urinish: bir daqiqa kuting') : error === 'password' ? t('Parol kamida 8 belgi') : error === 'timeZone' ? t('Vaqt mintaqasi noto‘g‘ri') : t('Saqlanmadi'));
     }
   });
@@ -1238,7 +1259,12 @@ function connect() {
     }
   };
   source.onopen = () => show(true);
-  source.onerror = () => show(false);
+  source.onerror = () => {
+    show(false);
+    // A dropped link is retried by the browser itself; an answer like 401 (the session ended, the server was
+    // updated) closes the stream for good, so a new one is opened: after signing in again it is live at once.
+    if (source.readyState === EventSource.CLOSED) setTimeout(connect, 5000);
+  };
   source.addEventListener('requests', refreshSoon);
   source.addEventListener('machines', refreshSoon);
 }

@@ -92,9 +92,10 @@ export function breakdown(db, from, to) {
 /**
  * The 5-hour windows of the last `days`, newest first, each with its tokens by model and by machine. A
  * window opens with the first request after the last one closed, from the start of that hour.
- * Its share is measured against the limit seen at the last 429, or else against the biggest window.
+ * Its share is Anthropic's own last percentage for it when an agent reported during it; else it is measured
+ * against what was spent by the last 429, or else against the biggest window.
  */
-export function windowHistory(db, { now = Date.now(), hours = 5, days = 7, fallback = fallbackAccount(db), limits = new Map() }) {
+export function windowHistory(db, { now = Date.now(), hours = 5, days = 7, fallback = fallbackAccount(db), limits = new Map(), reports = new Map() }) {
   const length = hours * HOUR;
   const rows = db
     .prepare(
@@ -104,13 +105,23 @@ export function windowHistory(db, { now = Date.now(), hours = 5, days = 7, fallb
     )
     .all(fallback, now - days * DAY - length);
 
+  // The current window's start as Anthropic reported it (see anchoredWindow): the guess from gaps gives way to it.
+  const anchors = new Map();
+  for (const [account, list] of reports) {
+    const current = [...list].reverse().find((r) => r.ts >= now - length && r.resetsAt > now && r.resetsAt - length <= now);
+    if (current) anchors.set(account, current.resetsAt - length);
+  }
+
   const open = new Map();
   const windows = [];
   for (const row of rows) {
     const account = row.account;
     let window = open.get(account);
-    if (!window || row.ts >= window.start + length) {
-      window = { account, start: row.ts - (row.ts % HOUR), cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, requests: 0, models: {}, machines: {} };
+    const anchor = anchors.get(account);
+    const anchored = anchor !== undefined && row.ts >= anchor && (!window || window.start < anchor);
+    if (!window || row.ts >= window.start + length || anchored) {
+      if (anchored && window) window.end = Math.min(window.end, anchor);
+      window = { account, start: anchored ? anchor : row.ts - (row.ts % HOUR), cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, requests: 0, models: {}, machines: {} };
       window.end = window.start + length;
       open.set(account, window);
       windows.push(window);
@@ -140,15 +151,63 @@ export function windowHistory(db, { now = Date.now(), hours = 5, days = 7, fallb
     .map((window) => {
       const limit = limits.get(window.account) ?? null;
       const basis = limit ?? biggest.get(window.account) ?? 0;
+      // Anthropic's last word on the window, when an agent reported during it: a report made inside the window
+      // about an Anthropic window that began around it (not about the one before).
+      const reported = (reports.get(window.account) ?? [])
+        .filter((r) => r.ts >= window.start && r.ts < window.end && r.resetsAt > r.ts && r.resetsAt - 5 * HOUR >= window.start - HOUR)
+        .pop();
+      // A reported window is shown at Anthropic's times (as /usage has them), not the hour it was guessed from.
+      const end = reported ? Math.min(reported.resetsAt, window.end + HOUR) : window.end;
       return {
         ...window,
+        ...(reported ? { start: end - length, end } : {}),
         tokens: window.input + window.output + window.cacheRead + window.cacheWrite,
         models: Object.values(window.models).sort((a, b) => b.cost - a.cost),
-        open: now < window.end,
-        share: basis > 0 ? window.cost / basis : null,
-        basis: limit ? 'limit' : 'biggest',
+        open: now < end,
+        // Measured by spending, a window can come out over the limit (a dollar does not buy the same share every
+        // time: caching, models); Anthropic stops at 100%, so the estimate does too.
+        share: reported ? reported.percent / 100 : basis > 0 ? Math.min(1, window.cost / basis) : null,
+        basis: reported ? 'reported' : limit ? 'limit' : 'biggest',
       };
     });
+}
+
+/**
+ * What an account had spent up to a 429 (the limit reached): in its 5-hour window and in the week before. It
+ * is worked out each time from every request the monitor has by now, not kept from the moment of the 429: a
+ * Claude Code without telemetry reaches the monitor only later, through the agent's look at the logs every ten minutes.
+ * The window starts where Anthropic said it did, when a report from around then says so.
+ */
+export function hitSpending(db, hit, { hours = 5, fallback = fallbackAccount(db) } = {}) {
+  const account = hit.account ?? fallback;
+  let from = hit.ts - hours * HOUR;
+  const near = db
+    .prepare('SELECT limits FROM usage_reports WHERE ts BETWEEN ? AND ? AND (account = ? OR account IS NULL) ORDER BY abs(ts - ?) LIMIT 1')
+    .get(hit.ts - 30 * 60_000, hit.ts + 30 * 60_000, account, hit.ts);
+  const resets = Date.parse(near ? JSON.parse(near.limits).find((l) => l.kind === 'five_hour')?.resetsAt ?? '' : '');
+  if (Number.isFinite(resets) && resets > hit.ts) from = Math.max(from, resets - 5 * HOUR);
+  const spent = db.prepare(
+    `SELECT coalesce(sum(r.cost), 0) AS cost FROM requests r JOIN machines m ON m.id = r.machine_id WHERE r.ts >= ? AND r.ts <= ? AND ${ACCOUNT} = ?`,
+  );
+  return { window: spent.get(from, hit.ts, fallback, account).cost, week: spent.get(hit.ts - 7 * DAY, hit.ts, fallback, account).cost };
+}
+
+/**
+ * Each account's 5-hour percentages from the agents' reports since `from`, oldest first: windowHistory takes a
+ * window's last one as what the window used, in Anthropic's own words.
+ */
+export function windowReports(db, from, fallback = fallbackAccount(db)) {
+  const ownAccount = new Map(db.prepare('SELECT id, account FROM machines').all().map((m) => [m.id, m.account]));
+  const reports = new Map();
+  for (const row of db.prepare('SELECT ts, machine_id AS machineId, account, limits FROM usage_reports WHERE ts >= ? ORDER BY ts').all(from)) {
+    const five = JSON.parse(row.limits).find((l) => l.kind === 'five_hour');
+    const resetsAt = Date.parse(five?.resetsAt ?? '');
+    if (!five || !Number.isFinite(resetsAt)) continue;
+    const account = row.account ?? ownAccount.get(row.machineId) ?? fallback;
+    (reports.get(account) ?? reports.set(account, []).get(account)).push({ ts: row.ts, percent: five.percent, resetsAt });
+  }
+
+  return reports;
 }
 
 /** This week and month against the last ones, by model. */
@@ -159,6 +218,24 @@ export function comparisons(db, settings, now = Date.now()) {
     previous: { ...breakdown(db, previous.from, previous.to), label: previous.label },
   });
   return { day: pair(p.today, p.yesterday), week: pair(p.week, p.lastWeek), month: pair(p.month, p.lastMonth) };
+}
+
+/**
+ * When the account's current 5-hour window began, as Anthropic said in a report from within it (its reset time
+ * less the window's length); null without one. Guessed from the gaps between requests, the start drifts away
+ * from Anthropic's after hours of work without a break.
+ */
+export function anchoredWindow(db, account, now = Date.now(), hours = 5) {
+  if (!account) return null;
+  const length = hours * HOUR;
+  for (const row of db
+    .prepare('SELECT r.limits FROM usage_reports r LEFT JOIN machines m ON m.id = r.machine_id WHERE r.ts >= ? AND coalesce(r.account, m.account) = ? ORDER BY r.ts DESC LIMIT 20')
+    .all(now - length, account)) {
+    const resets = Date.parse(JSON.parse(row.limits).find((l) => l.kind === 'five_hour')?.resetsAt ?? '');
+    if (Number.isFinite(resets) && resets > now && resets - length <= now) return resets - length;
+  }
+
+  return null;
 }
 
 /**
@@ -183,6 +260,10 @@ export function machineLimits(db, settings, machine, now = Date.now()) {
   for (const { ts } of recent) {
     if (windowStart === null || ts >= windowStart + hours * HOUR) windowStart = ts - (ts % HOUR);
   }
+
+  // Anthropic's own start of the account's window, when a report says it.
+  const anchored = anchoredWindow(db, machine.limit_account ?? machine.account ?? fallbackAccount(db), now, hours);
+  if (anchored !== null) windowStart = anchored;
 
   const windowOpen = windowStart !== null && now < windowStart + hours * HOUR;
   const list = [

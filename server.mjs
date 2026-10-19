@@ -7,7 +7,7 @@ import { createServer } from 'node:http';
 import { appendFile, mkdir, readdir, readFile, rm } from 'node:fs/promises';
 import { gunzipSync } from 'node:zlib';
 import { randomBytes } from 'node:crypto';
-import { dirname, extname, join, resolve } from 'node:path';
+import { dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDb, getSettings, keepPrivate, prune, setSetting } from './src/db.mjs';
 import { ingestLogs, ingestMetrics } from './src/otlp.mjs';
@@ -18,7 +18,7 @@ import { checkBudgets, checkPolicy, raise, recordLimit, sendTelegram } from './s
 import { EFFORTS, MODEL_FAMILIES, parseModels, policyOf } from './src/policy.mjs';
 import { exportCsv } from './src/export.mjs';
 import { LANGUAGES, limitName, msg, when } from './src/messages.mjs';
-import { accountEmails, breakdown, comparisons, exactUsage, fallbackAccount, limitAmount, limitLabel, machineLimits, mayUseAccount, periods, saveExactUsage, windowHistory } from './src/usage.mjs';
+import { accountEmails, breakdown, comparisons, exactUsage, fallbackAccount, hitSpending, limitAmount, limitLabel, machineLimits, mayUseAccount, periods, saveExactUsage, windowHistory, windowReports } from './src/usage.mjs';
 import { clientAddress } from './src/net.mjs';
 
 const ROOT = fileURLToPath(new URL('.', import.meta.url));
@@ -129,7 +129,8 @@ const STATIC = {
 async function serveStatic(response, path) {
   const publicDir = resolve(ROOT, 'public');
   const file = resolve(publicDir, '.' + (path === '/' ? '/index.html' : path));
-  if (!file.startsWith(publicDir)) {
+  // Inside public/ itself, not in a folder beside it whose name begins the same way.
+  if (!file.startsWith(publicDir + sep)) {
     return send(response, 404, 'Not found');
   }
 
@@ -233,7 +234,11 @@ async function api(request, response, url) {
     if (!machine) return refuse(request, response);
     const body = await readJson(request);
     const result = importRecords(db, machine, body.records ?? [], { ip: ipOf(request), meta: body.machine });
-    if (result.added > 0) broadcast('requests', result.added);
+    if (result.added > 0) {
+      // A Claude Code without telemetry is seen only this way: its spending counts against the limits too.
+      checkBudgets(db, [machine.id]);
+      broadcast('requests', result.added);
+    }
     return send(response, 200, result);
   }
 
@@ -349,19 +354,22 @@ async function api(request, response, url) {
   if (pathname === '/api/windows' && method === 'GET') {
     const machines = db.prepare('SELECT id, name, color, account FROM machines').all();
     const fallback = fallbackAccount(db);
-    // The limit seen at an account's last 429, to say how much of it a window used.
-    const limits = new Map();
-    for (const hit of db.prepare('SELECT account, window_cost FROM limit_hits ORDER BY ts').all()) {
-      if (hit.window_cost > 0) limits.set(hit.account ?? fallback, hit.window_cost);
-    }
-
     const days = Math.min(30, Math.max(1, Number(url.searchParams.get('days')) || 7));
     const hours = Number(settings.windowHours) || 5;
+    // The limit seen at an account's last 429, to say how much of it a window used: what the account had spent
+    // by then as far as the monitor knows now (history from the logs comes in late).
+    const limits = new Map();
+    for (const hit of db.prepare('SELECT account, ts FROM limit_hits ORDER BY ts').all()) {
+      const { window } = hitSpending(db, hit, { hours, fallback });
+      if (window > 0) limits.set(hit.account ?? fallback, window);
+    }
+
     const exact = exactUsage(db, Date.now(), { machines, settings, fallback });
+    const reports = windowReports(db, Date.now() - days * 86_400_000 - hours * 3_600_000, fallback);
     const exactLimits = new Map();
     for (const account of exact) {
       const session = account.limits.find((l) => l.kind === 'five_hour');
-      const open = windowHistory(db, { hours, days: 1, fallback }).find((w) => w.account === account.account && w.open);
+      const open = windowHistory(db, { hours, days: 1, fallback, reports }).find((w) => w.account === account.account && w.open);
       // Only from a share big enough to measure: 3% of a window is too little to scale from.
       if (session && !session.reset && session.percent >= 5 && open?.cost > 0) exactLimits.set(account.account, open.cost / (session.percent / 100));
     }
@@ -369,11 +377,13 @@ async function api(request, response, url) {
     return send(response, 200, {
       exact,
       exactLimits: Object.fromEntries(exactLimits),
-      windows: windowHistory(db, { hours, days, fallback, limits: new Map([...limits, ...exactLimits]) }).map((w) => {
+      windows: windowHistory(db, { hours, days, fallback, limits: new Map([...limits, ...exactLimits]), reports }).map((w) => {
         if (!exactLimits.has(w.account)) return w;
         // The open window is Anthropic's own: its percentage and the time it starts again, not a scaled guess.
         const session = w.open ? exact.find((e) => e.account === w.account)?.limits.find((l) => l.kind === 'five_hour') : null;
-        return session ? { ...w, basis: 'exact', share: session.percent / 100, end: Date.parse(session.resetsAt) || w.end } : { ...w, basis: 'exact' };
+        if (session) return { ...w, basis: 'exact', share: session.percent / 100, end: Date.parse(session.resetsAt) || w.end };
+        // A closed window Anthropic reported on keeps its own percentage.
+        return w.basis === 'reported' ? w : { ...w, basis: 'exact' };
       }),
       compare: comparisons(db, settings),
       machines: db.prepare('SELECT id, name, color FROM machines').all(),
@@ -429,16 +439,25 @@ async function api(request, response, url) {
     }
 
     const allowed = ['language', 'planName', 'planPrice', 'planAccount', 'billingDay', 'usdToUzs', 'windowHours', 'timeZone', 'chartDays', 'telegramChat', 'telegramToken'];
+    // Numbers the counting depends on: a negative window length or a 40th of the month would break every
+    // window and period. Empty means "the default". Everything is checked before anything is saved.
+    const ranges = { planPrice: [0, 100_000], usdToUzs: [0, 1_000_000], billingDay: [1, 31], windowHours: [1, 24], chartDays: [7, 90] };
+    for (const [key, [min, max]] of Object.entries(ranges)) {
+      if (body[key] === undefined || String(body[key]).trim() === '') continue;
+      const value = Number(body[key]);
+      if (!Number.isFinite(value) || value < min || value > max) return send(response, 400, { error: key });
+    }
+
+    if (body.timeZone !== undefined) {
+      try {
+        new Intl.DateTimeFormat('en', { timeZone: body.timeZone });
+      } catch {
+        return send(response, 400, { error: 'timeZone' });
+      }
+    }
+
     for (const key of allowed) {
       if (body[key] === undefined || (key === 'telegramToken' && String(body[key]).startsWith('••••'))) continue;
-      if (key === 'timeZone') {
-        try {
-          new Intl.DateTimeFormat('en', { timeZone: body[key] });
-        } catch {
-          return send(response, 400, { error: 'timeZone' });
-        }
-      }
-
       setSetting(db, key, String(body[key]).trim().slice(0, 200));
     }
 
@@ -468,7 +487,7 @@ async function api(request, response, url) {
     const count = db.prepare('SELECT count(*) AS n FROM machines').get().n;
     const result = db
       .prepare('INSERT INTO machines (name, token_hash, token_hint, color, created_at, daily_budget, note) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(name, hash, hint, COLORS[count % COLORS.length], Date.now(), Number(body.budget) > 0 ? Number(body.budget) : null, body.note ?? null);
+      .run(name, hash, hint, COLORS[count % COLORS.length], Date.now(), Number(body.budget) > 0 ? Number(body.budget) : null, body.note == null ? null : String(body.note).slice(0, 300) || null);
     return send(response, 201, { id: Number(result.lastInsertRowid), name, token });
   }
 
@@ -479,16 +498,21 @@ async function api(request, response, url) {
 
     // A new share link (the old one stops working), or none: DELETE.
     if (machineMatch[2] === '/share') {
+      // Only these two change it: a GET must never end the link.
+      if (method !== 'POST' && method !== 'DELETE') return send(response, 405, { error: 'method' });
       const share = method === 'POST' ? randomBytes(18).toString('base64url') : null;
       db.prepare('UPDATE machines SET share_token = ? WHERE id = ?').run(share, id);
       return send(response, 200, { share });
     }
 
-    if (machineMatch[2] === '/token' && method === 'POST') {
+    if (machineMatch[2] === '/token') {
+      if (method !== 'POST') return send(response, 405, { error: 'method' });
       const { token, hash, hint } = newToken();
       db.prepare('UPDATE machines SET old_token_hash = token_hash, token_hash = ?, token_hint = ? WHERE id = ?').run(hash, hint, id);
       return send(response, 200, { token });
     }
+
+    // From here on the machine itself: a DELETE or PATCH meant for /token or /share never reaches it.
 
     if (method === 'GET') {
       return send(response, 200, machineDetail(db, settings, id));

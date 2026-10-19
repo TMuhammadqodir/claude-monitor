@@ -171,12 +171,15 @@ person using the computer. "New link" replaces it, "Turn the link off" closes it
 ## Repairs itself
 
 - **Lost usage.** When the server is down, a computer sleeps or its token is wrong, telemetry loses those
-  requests. Once an hour the agent (in the background, without holding up Claude Code) sends the recent logs
+  requests. Every 10 minutes the agent (in the background, without holding up Claude Code) sends the recent logs
   again: the gaps fill, nothing counts twice.
 - **Updating.** Only when set up with `--auto-update`: every 6 hours the agent compares itself with the
   server's `agent.mjs` and, when they differ, takes the new one (after a syntax check) and lets it set its
   hooks. It is off by default because it runs the server's code on the computer, where Claude Code's sign-in
   key is: turn it on only for a server you trust, over HTTPS or Tailscale.
+- **No telemetry.** A Claude Code opened before `setup` (or still running with a token replaced since) sends
+  nothing live; its spending reaches the monitor only from the logs, up to 10 minutes late. The computer's card
+  says so ("⚠ No telemetry: <project>"): close that Claude Code once and open it again.
 - **Refused token.** After "New token", a computer still sending the old one shows in the dashboard's alerts;
   its Claude Code says so once an hour, and `node agent.mjs status` shows "Link: ✗".
 
